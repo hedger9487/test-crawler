@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "test-crawler"
+version = "0.1.0"
+description = "Scalable async web crawler for Architecture Design HW1"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "selectolax>=0.3",
+    "pyyaml>=6.0",
+    "mmh3>=4.0",
+    "bitarray>=2.8",
+    "aiosqlite>=0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "aioresponses>=0.7",
+]
+
+[project.scripts]
+crawl = "crawler.main:cli_main"

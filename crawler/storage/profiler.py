@@ -1,0 +1,377 @@
+"""Comprehensive crawler profiler and monitoring system.
+
+Tracks every aspect of crawler performance:
+  - Worker utilization (active vs idle/waiting)
+  - Fetch latency distribution (p50, p95, p99)
+  - Status code distribution
+  - Domain yield: how many new URLs each domain produces
+  - Content type distribution
+  - Rate limiter wait time
+  - Robots.txt block rate
+  - Discovery efficiency: new URLs per page crawled
+  - Top producing domains
+"""
+
+from __future__ import annotations
+
+import asyncio
+import collections
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Dict, List
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WorkerSnapshot:
+    """A snapshot of what a worker is doing."""
+    state: str = "idle"  # idle, waiting_frontier, waiting_robots, waiting_rate_limit, fetching, parsing
+    current_url: str = ""
+    current_domain: str = ""
+    state_since: float = 0.0
+
+
+class CrawlProfiler:
+    """Comprehensive profiling and monitoring for the crawler.
+
+    Collects fine-grained metrics and periodically writes reports.
+    """
+
+    def __init__(
+        self,
+        num_workers: int,
+        report_interval: float = 30.0,
+        report_path: str = "crawl_profile.jsonl",
+    ):
+        self._num_workers = num_workers
+        self._report_interval = report_interval
+        self._report_path = report_path
+        self._start_time = time.monotonic()
+
+        # ── Worker state tracking ──
+        self._worker_states: Dict[int, WorkerSnapshot] = {
+            i: WorkerSnapshot() for i in range(num_workers)
+        }
+
+        # ── Counters ──
+        self._urls_crawled = 0
+        self._urls_success = 0
+        self._urls_error = 0
+        self._urls_timeout = 0
+        self._urls_discovered = 0   # total new unique URLs found
+        self._robots_blocked = 0
+        self._content_skipped = 0   # non-HTML skipped
+
+        # ── Status code distribution ──
+        self._status_counts: Dict[int, int] = collections.defaultdict(int)
+
+        # ── Domain-level stats ──
+        # domain -> number of successful crawls
+        self._domain_crawl_count: Dict[str, int] = collections.defaultdict(int)
+        # domain -> total new URLs discovered from that domain
+        self._domain_yield: Dict[str, int] = collections.defaultdict(int)
+        # domain -> number of errors
+        self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
+
+        # ── Latency tracking (in ms) ──
+        self._latencies: list[float] = []
+        self._latency_lock = asyncio.Lock()
+
+        # ── Rate limiter wait tracking (in seconds) ──
+        self._total_rate_wait: float = 0.0
+        self._rate_wait_count: int = 0
+
+        # ── Frontier scheduling ──
+        self._frontier_cooldown_skips: int = 0
+        self._frontier_ref = None  # set via set_frontier_ref()
+
+        # ── Time-series for analysis ──
+        # List of (timestamp, urls_crawled, urls_discovered, urls_success)
+        self._time_series: list[tuple[float, int, int, int]] = []
+
+        self._report_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+    def set_frontier_ref(self, frontier) -> None:
+        """Set a reference to the frontier for pulling cooldown skip stats."""
+        self._frontier_ref = frontier
+
+    # ── Worker state tracking ──
+
+    def worker_set_state(self, worker_id: int, state: str,
+                         url: str = "", domain: str = "") -> None:
+        """Update a worker's current state."""
+        snap = self._worker_states.get(worker_id)
+        if snap:
+            snap.state = state
+            snap.current_url = url
+            snap.current_domain = domain
+            snap.state_since = time.monotonic()
+
+    # ── Recording events ──
+
+    def record_fetch(self, domain: str, status: int, latency_ms: float,
+                     is_html: bool, error: str = "") -> None:
+        """Record the result of a fetch attempt."""
+        self._urls_crawled += 1
+        self._status_counts[status] += 1
+        self._domain_crawl_count[domain] += 1
+
+        if status == 200:
+            self._urls_success += 1
+        elif error == "timeout":
+            self._urls_timeout += 1
+            self._domain_error_count[domain] += 1
+        elif status == 0 or error:
+            self._urls_error += 1
+            self._domain_error_count[domain] += 1
+
+        if status == 200 and not is_html:
+            self._content_skipped += 1
+
+        # Track latency (only for completed requests)
+        if latency_ms > 0:
+            self._latencies.append(latency_ms)
+
+    def record_discovered(self, domain: str, new_count: int, total_links: int) -> None:
+        """Record URLs discovered from a page."""
+        self._urls_discovered += new_count
+        self._domain_yield[domain] += new_count
+
+    def record_robots_blocked(self, domain: str) -> None:
+        self._robots_blocked += 1
+
+    def record_rate_wait(self, wait_seconds: float) -> None:
+        self._total_rate_wait += wait_seconds
+        self._rate_wait_count += 1
+
+    # ── Domain scoring (for crawl strategy) ──
+
+    def get_domain_score(self, domain: str) -> float:
+        """Get a yield-based score for a domain. Higher = better for discovery.
+
+        Score = (new URLs discovered from domain) / (crawls of domain + 1)
+        Domains that produce many new URLs per crawl are prioritized.
+        """
+        crawls = self._domain_crawl_count.get(domain, 0)
+        yielded = self._domain_yield.get(domain, 0)
+        errors = self._domain_error_count.get(domain, 0)
+
+        if crawls == 0:
+            return 1.0  # Unknown domains get a neutral score (explore)
+
+        # Error penalty
+        error_rate = errors / max(crawls, 1)
+        if error_rate > 0.8:
+            return -1.0  # Mostly errors → deprioritize
+
+        # Yield per crawl
+        return yielded / (crawls + 1)
+
+    def get_top_domains(self, n: int = 20) -> List[Dict]:
+        """Get top N domains by yield."""
+        scored = []
+        for domain in set(self._domain_crawl_count) | set(self._domain_yield):
+            crawls = self._domain_crawl_count.get(domain, 0)
+            yielded = self._domain_yield.get(domain, 0)
+            errors = self._domain_error_count.get(domain, 0)
+            score = self.get_domain_score(domain)
+            scored.append({
+                "domain": domain,
+                "crawls": crawls,
+                "yield": yielded,
+                "errors": errors,
+                "yield_per_crawl": yielded / max(crawls, 1),
+                "score": round(score, 2),
+            })
+        scored.sort(key=lambda x: x["yield"], reverse=True)
+        return scored[:n]
+
+    # ── Latency percentiles ──
+
+    def _percentile(self, data: list[float], p: float) -> float:
+        if not data:
+            return 0.0
+        sorted_data = sorted(data)
+        k = (len(sorted_data) - 1) * (p / 100.0)
+        f = int(k)
+        c = min(f + 1, len(sorted_data) - 1)
+        d = k - f
+        return sorted_data[f] + d * (sorted_data[c] - sorted_data[f])
+
+    # ── Reporting ──
+
+    async def start(self) -> None:
+        self._start_time = time.monotonic()
+        self._report_task = asyncio.create_task(self._report_loop())
+
+    async def stop(self) -> None:
+        if self._report_task:
+            self._report_task.cancel()
+            try:
+                await self._report_task
+            except asyncio.CancelledError:
+                pass
+        await self._print_report(final=True)
+
+    async def _report_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._report_interval)
+                await self._print_report()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Profiler report error: %s", e)
+
+    async def _print_report(self, final: bool = False) -> None:
+        # Sync frontier stats
+        if self._frontier_ref:
+            self._frontier_cooldown_skips = self._frontier_ref.cooldown_skips
+
+        elapsed = time.monotonic() - self._start_time
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        seconds = int(elapsed % 60)
+
+        overall_qps = self._urls_crawled / elapsed if elapsed > 0 else 0.0
+        success_rate = (self._urls_success / max(self._urls_crawled, 1)) * 100
+        discovery_rate = self._urls_discovered / max(self._urls_success, 1)
+
+        # Worker utilization
+        now = time.monotonic()
+        worker_states = collections.Counter(
+            snap.state for snap in self._worker_states.values()
+        )
+        active_pct = (
+            (worker_states.get("fetching", 0) + worker_states.get("parsing", 0))
+            / max(self._num_workers, 1) * 100
+        )
+        waiting_rate_pct = worker_states.get("waiting_rate_limit", 0) / max(self._num_workers, 1) * 100
+        idle_pct = (
+            (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0))
+            / max(self._num_workers, 1) * 100
+        )
+
+        # Latency percentiles
+        recent_latencies = self._latencies[-1000:]  # last 1000 for recency
+        p50 = self._percentile(recent_latencies, 50)
+        p95 = self._percentile(recent_latencies, 95)
+        p99 = self._percentile(recent_latencies, 99)
+
+        # Status distribution (top 5)
+        status_sorted = sorted(self._status_counts.items(), key=lambda x: -x[1])[:8]
+        status_str = "  ".join(f"{s}:{c}" for s, c in status_sorted) if status_sorted else "none"
+
+        # Average rate limiter wait
+        avg_rate_wait = self._total_rate_wait / max(self._rate_wait_count, 1)
+
+        # Top 5 domains by yield
+        top_domains = self.get_top_domains(5)
+
+        header = "═══ FINAL CRAWL PROFILE ═══" if final else "─── CRAWL PROFILE ───"
+        sep = "═" * 50 if final else "─" * 50
+
+        report = f"""
+{header}
+  Time:       {hours:02d}:{minutes:02d}:{seconds:02d}   QPS: {overall_qps:.2f}
+
+  📊 THROUGHPUT
+    Crawled:      {self._urls_crawled:>10,}
+    Successful:   {self._urls_success:>10,}   ({success_rate:.1f}%)
+    Errors:       {self._urls_error:>10,}
+    Timeouts:     {self._urls_timeout:>10,}
+    Robots blk:   {self._robots_blocked:>10,}
+
+  🔗 DISCOVERY
+    New URLs:     {self._urls_discovered:>10,}
+    Yield/page:   {discovery_rate:>10.1f}   (new URLs per successful page)
+    Domains:      {len(self._domain_crawl_count):>10,}
+
+  ⏱  LATENCY (ms)
+    p50: {p50:>8.0f}   p95: {p95:>8.0f}   p99: {p99:>8.0f}
+
+  👷 WORKERS ({self._num_workers} total)
+    Active:       {active_pct:>8.1f}%   (fetching/parsing)
+    Rate wait:    {waiting_rate_pct:>8.1f}%
+    Idle:         {idle_pct:>8.1f}%
+    Avg wait:     {avg_rate_wait:>8.2f}s per acquire
+    CD skips:     {self._frontier_cooldown_skips:>8,}   (frontier skipped cooling domains)
+
+  📈 STATUS CODES
+    {status_str}
+
+  🏆 TOP DOMAINS (by yield)"""
+
+        for d in top_domains:
+            report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ypc:{d['yield_per_crawl']:.1f}"
+
+        report += f"\n{sep}"
+        logger.info(report)
+
+        # Record time series point
+        self._time_series.append((
+            elapsed, self._urls_crawled, self._urls_discovered, self._urls_success
+        ))
+
+        # Write JSONL snapshot for post-analysis
+        if final:
+            await self._write_final_report()
+
+    async def _write_final_report(self) -> None:
+        """Write a detailed JSON report for post-crawl analysis."""
+        try:
+            report = {
+                "summary": {
+                    "elapsed_seconds": time.monotonic() - self._start_time,
+                    "total_crawled": self._urls_crawled,
+                    "total_success": self._urls_success,
+                    "total_errors": self._urls_error,
+                    "total_timeouts": self._urls_timeout,
+                    "total_discovered": self._urls_discovered,
+                    "total_robots_blocked": self._robots_blocked,
+                    "unique_domains": len(self._domain_crawl_count),
+                    "success_rate": self._urls_success / max(self._urls_crawled, 1),
+                    "yield_per_page": self._urls_discovered / max(self._urls_success, 1),
+                },
+                "status_distribution": dict(self._status_counts),
+                "latency": {
+                    "p50": self._percentile(self._latencies, 50),
+                    "p95": self._percentile(self._latencies, 95),
+                    "p99": self._percentile(self._latencies, 99),
+                    "avg": sum(self._latencies) / max(len(self._latencies), 1),
+                },
+                "rate_limiter": {
+                    "total_wait_seconds": self._total_rate_wait,
+                    "avg_wait_seconds": self._total_rate_wait / max(self._rate_wait_count, 1),
+                    "total_acquires": self._rate_wait_count,
+                },
+                "top_domains": self.get_top_domains(50),
+                "time_series": [
+                    {"elapsed": t, "crawled": c, "discovered": d, "success": s}
+                    for t, c, d, s in self._time_series
+                ],
+            }
+            path = Path(self._report_path)
+            path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+            logger.info("📄 Detailed profile saved to: %s", path)
+        except Exception as e:
+            logger.error("Failed to write profile report: %s", e)
+
+    @property
+    def summary(self) -> dict:
+        elapsed = time.monotonic() - self._start_time
+        return {
+            "crawled": self._urls_crawled,
+            "success": self._urls_success,
+            "errors": self._urls_error,
+            "discovered": self._urls_discovered,
+            "robots_blocked": self._robots_blocked,
+            "elapsed_seconds": elapsed,
+            "qps": self._urls_crawled / elapsed if elapsed > 0 else 0.0,
+            "success_rate": self._urls_success / max(self._urls_crawled, 1),
+        }

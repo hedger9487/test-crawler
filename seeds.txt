@@ -1,0 +1,8 @@
+# Example seed URLs — replace with professor's 1000 seeds
+# One URL per line, lines starting with # are comments
+
+https://www.example.com
+https://en.wikipedia.org/wiki/Web_crawler
+https://news.ycombinator.com
+https://www.reddit.com
+https://github.com

@@ -1,0 +1,88 @@
+# ============================================================
+# Crawler Configuration
+# ============================================================
+
+crawler:
+  # Maximum number of concurrent worker coroutines
+  concurrency: 200
+
+  # Maximum crawl duration in seconds (48 hours = 172800)
+  max_time_seconds: 172800
+
+  # User-Agent string sent with every request
+  user_agent: "HW1-Crawler/0.1 (Architecture Design Course; +https://example.edu)"
+
+  # Seed file path
+  seeds_file: "seeds.txt"
+
+# ============================================================
+# Fetcher
+# ============================================================
+fetcher:
+  # Per-request timeout in seconds
+  timeout: 30
+
+  # Maximum number of redirects to follow
+  max_redirects: 5
+
+  # Total connection pool size
+  connection_pool_size: 100
+
+  # Maximum connections to a single host
+  per_host_connections: 2
+
+  # Accepted content types (prefix match)
+  accept_content_types:
+    - "text/html"
+    - "application/xhtml+xml"
+
+# ============================================================
+# Politeness
+# ============================================================
+politeness:
+  # Maximum queries per second per domain
+  max_qps: 0.5
+
+  # robots.txt cache TTL in seconds (24 hours)
+  robots_cache_ttl: 86400
+
+  # Timeout for fetching robots.txt
+  robots_fetch_timeout: 10
+
+# ============================================================
+# Frontier
+# ============================================================
+frontier:
+  # Bloom filter expected capacity
+  bloom_capacity: 50_000_000
+
+  # Bloom filter false-positive rate
+  bloom_error_rate: 0.001
+
+  # Maximum crawl depth from seed (-1 = unlimited)
+  max_depth: -1
+
+  # Checkpoint interval in seconds
+  checkpoint_interval: 300
+
+  # Checkpoint file path
+  checkpoint_path: "checkpoint.pkl"
+
+# ============================================================
+# Storage
+# ============================================================
+storage:
+  # SQLite database path
+  db_path: "crawl_data.db"
+
+  # Batch insert size
+  batch_size: 100
+
+# ============================================================
+# Logging
+# ============================================================
+logging:
+  level: "INFO"
+
+  # Stats reporting interval in seconds
+  stats_interval: 30
