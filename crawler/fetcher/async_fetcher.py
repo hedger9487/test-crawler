@@ -36,7 +36,11 @@ class AsyncFetcher(AbstractFetcher):
         accept_content_types: list[str] | None = None,
     ):
         self._user_agent = user_agent
-        self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._timeout = aiohttp.ClientTimeout(
+            total=timeout,       # overall request limit
+            sock_connect=10,      # TCP connect timeout (prevents DNS/handshake hangs)
+            sock_read=timeout,   # per-read timeout (kills zombie connections)
+        )
         self._max_redirects = max_redirects
         self._pool_size = pool_size
         self._per_host = per_host

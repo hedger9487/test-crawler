@@ -229,12 +229,22 @@ class CrawlProfiler:
                 logger.error("Profiler report error: %s", e)
 
     async def _print_report(self, final: bool = False) -> None:
-        # Sync frontier stats
+        # Sync frontier stats and push yield scores
+        frontier_dropped = 0
+        frontier_states = {}
         if self._frontier_ref:
             self._frontier_cooldown_skips = self._frontier_ref.cooldown_skips
             frontier_dropped = getattr(self._frontier_ref, 'urls_dropped', 0)
-        else:
-            frontier_dropped = 0
+            frontier_states = getattr(self._frontier_ref, 'state_stats', {})
+            if hasattr(frontier_states, '__call__'):
+                frontier_states = {}
+
+            # Push yield scores to frontier for priority scheduling
+            scores = {}
+            for domain in self._domain_crawl_count:
+                scores[domain] = self.get_domain_score(domain)
+            if scores:
+                self._frontier_ref.update_domain_priorities(scores)
 
         elapsed = time.monotonic() - self._start_time
         hours = int(elapsed // 3600)
@@ -301,8 +311,14 @@ class CrawlProfiler:
     Rate wait:    {waiting_rate_pct:>8.1f}%
     Idle:         {idle_pct:>8.1f}%
     Avg wait:     {avg_rate_wait:>8.2f}s per acquire
-    CD skips:     {self._frontier_cooldown_skips:>8,}   (frontier skipped cooling domains)
+    CD skips:     {self._frontier_cooldown_skips:>8,}   (forced cooling domain picks)
     Conn errs:    {self._status_counts.get(0, 0):>8,}   (status=0, network failures)
+
+  🔄 FRONTIER STATES
+    Ready:        {frontier_states.get('ready', 0):>8,}   (available for fetch)
+    Cooling:      {frontier_states.get('cooling', 0):>8,}   (waiting for cooldown)
+    Empty:        {frontier_states.get('empty', 0):>8,}   (no pending URLs)
+    Promotions:   {frontier_states.get('promotions', 0):>8,}   (cooling → ready)
 
   📈 STATUS CODES
     {status_str}

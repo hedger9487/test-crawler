@@ -54,7 +54,6 @@ class CrawlOrchestrator:
 
         # Sitemap tracking: domains we've already fetched sitemaps for
         self._sitemap_fetched: set[str] = set()
-        self._sitemap_discovered: int = 0
 
     async def run(self, seed_urls: list[str], resume: bool = False) -> None:
         """Main entry point: initialize, seed, run workers, shutdown."""
@@ -305,9 +304,6 @@ class CrawlOrchestrator:
                 page_urls = await robots.fetch_sitemap(surl)
                 if not page_urls:
                     continue
-
-                # Count all as discovered
-                self._sitemap_discovered += len(page_urls)
 
                 # Add to frontier — bloom filter handles dedup,
                 # frontier cap handles memory. The user's idea:

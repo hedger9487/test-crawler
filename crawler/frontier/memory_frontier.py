@@ -1,13 +1,19 @@
-"""In-memory URL frontier with Bloom filter deduplication and domain-aware scheduling.
+"""In-memory URL frontier with three-state domain scheduling.
 
-Uses per-domain queues for fair round-robin scheduling and a Bloom filter
-for O(1) memory-efficient dedup at scale (50M URLs ≈ 80 MB).
+Domain states:
+  Ready   → max-heap by yield score: domains available for immediate fetch
+  Cooling → min-heap by ready_at: domains waiting for rate-limit cooldown
+  Empty   → set: domains with no pending URLs
 
-Hybrid scheduling strategy:
-  - Round-robins across domains to ensure breadth
-  - SKIPS domains that are in rate-limit cooldown (coarse check via peek)
-  - Worker does fine-grained rate-limit acquire for precise compliance
-  - Within a domain, URLs are ordered by depth (BFS: shallow first)
+Transitions:
+  Ready → Cooling: after get_next() pops a URL from a domain
+  Cooling → Ready: when cooldown expires (promoted on next get_next())
+  Ready → Empty: domain's queue exhausted after pop
+  Empty → Ready: add_url() adds a URL to an empty domain
+  Cooling + add_url: stays Cooling (will return to Ready when cooldown expires)
+
+Uses per-domain URL queues (min-heap by depth for BFS within a domain)
+and a Bloom filter for O(1) memory-efficient dedup at scale.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import heapq
+import logging
 import pickle
 import time
 from pathlib import Path
@@ -26,13 +33,15 @@ import mmh3
 from crawler.frontier.base import AbstractFrontier, CrawlURL
 from crawler.parser.url_normalizer import get_domain, normalize_url
 
+logger = logging.getLogger(__name__)
+
 
 class BloomFilter:
     """Simple Bloom filter backed by bitarray + mmh3."""
 
     __slots__ = ("_size", "_num_hashes", "_bits", "_count")
 
-    def __init__(self, capacity: int = 50_000_000, error_rate: float = 0.001):
+    def __init__(self, capacity: int = 100_000_000, error_rate: float = 0.001):
         import math
         self._size = self._optimal_size(capacity, error_rate)
         self._num_hashes = self._optimal_hashes(self._size, capacity)
@@ -72,15 +81,19 @@ class BloomFilter:
         return [(h1 + i * h2) % self._size for i in range(self._num_hashes)]
 
 
+# Default cooldown when no checker is available (seconds)
+_DEFAULT_COOLDOWN = 2.0
+
+
 class MemoryFrontier(AbstractFrontier):
-    """In-memory frontier with domain-aware scheduling.
+    """In-memory frontier with three-state domain scheduling.
 
-    Hybrid design:
-      - Frontier skips domains currently in cooldown (coarse-grained)
-      - Worker still does precise rate-limit acquire (fine-grained safety net)
-      - Result: workers almost never block on rate-limit, maximizing throughput
+    States:
+      Ready:   domains with URLs, not in cooldown → pick highest yield first
+      Cooling: domains with URLs, waiting for cooldown → auto-promote when ready
+      Empty:   domains with no pending URLs → re-activate when URLs arrive
 
-    The cooldown checker is injected via set_cooldown_checker().
+    get_next() is O(log N) — no scanning needed.
     """
 
     def __init__(
@@ -94,46 +107,98 @@ class MemoryFrontier(AbstractFrontier):
         self._max_depth = max_depth
         self._max_pending = max_pending
 
-        # domain -> list of CrawlURL (used as a min-heap by depth)
+        # Per-domain URL queues (min-heap by depth for BFS within domain)
         self._domain_queues: dict[str, list[CrawlURL]] = collections.defaultdict(list)
 
-        # Round-robin state: ordered list of domains with pending URLs
-        self._active_domains: collections.deque[str] = collections.deque()
-        self._active_domain_set: set[str] = set()
+        # ── Three-state domain management ──
 
-        # Domain priority scores (higher = better, from profiler)
-        self._domain_priority: dict[str, float] = {}
+        # Ready: max-heap by yield score.
+        # Stored as (-yield_score, tie_breaker, domain) for min-heap inversion.
+        self._ready: list[tuple[float, int, str]] = []
+
+        # Cooling: min-heap by ready_at timestamp.
+        # Stored as (ready_at, tie_breaker, domain).
+        self._cooling: list[tuple[float, int, str]] = []
+
+        # Empty: domains with no pending URLs.
+        self._empty: set[str] = set()
+
+        # Track which state each domain is in (for O(1) lookup)
+        # Values: "ready", "cooling", "empty", or absent (never seen)
+        self._domain_state: dict[str, str] = {}
+
+        # Yield scores: discovered_urls / pages_crawled per domain
+        # Higher = more valuable for discovery
+        self._domain_yield: dict[str, float] = {}
+
+        # Monotonic tie-breaker to keep heap stable
+        self._tie_counter = 0
 
         self._pending_count = 0
         self._lock = asyncio.Lock()
 
         # Cooldown checker: domain -> estimated wait seconds (0 = ready)
-        # Injected by orchestrator, calls rate_limiter.peek_wait_time()
         self._cooldown_checker: Optional[Callable[[str], float]] = None
 
         # Profiling
-        self._cooldown_skips = 0
-        self._lock_wait_total: float = 0.0   # total seconds workers waited for lock
-        self._lock_hold_total: float = 0.0   # total seconds lock was held
-        self._lock_acquisitions: int = 0     # number of get_next() calls
-        self._urls_dropped: int = 0          # URLs skipped due to frontier cap
+        self._cooldown_skips = 0     # for backward compat with profiler
+        self._promotions = 0         # cooling → ready transitions
+        self._lock_wait_total: float = 0.0
+        self._lock_hold_total: float = 0.0
+        self._lock_acquisitions: int = 0
+        self._urls_dropped: int = 0
+
+    # ── Configuration ──
 
     def set_cooldown_checker(self, checker: Callable[[str], float]) -> None:
-        """Inject a function that returns estimated cooldown for a domain.
-
-        Args:
-            checker: A callable(domain) -> float. Returns 0.0 if ready,
-                     or estimated seconds until the domain is available.
-        """
+        """Inject a function that returns estimated cooldown for a domain."""
         self._cooldown_checker = checker
 
     def update_domain_priority(self, domain: str, score: float) -> None:
-        """Update the priority score for a domain (from profiler yield data)."""
-        self._domain_priority[domain] = score
+        """Update the yield score for a domain."""
+        self._domain_yield[domain] = score
 
     def update_domain_priorities(self, scores: dict[str, float]) -> None:
-        """Batch update domain priorities."""
-        self._domain_priority.update(scores)
+        """Batch update yield scores from profiler."""
+        self._domain_yield.update(scores)
+
+    # ── Heap helpers ──
+
+    def _next_tie(self) -> int:
+        self._tie_counter += 1
+        return self._tie_counter
+
+    def _push_ready(self, domain: str) -> None:
+        """Push domain into the Ready heap."""
+        score = self._domain_yield.get(domain, 1.0)
+        heapq.heappush(self._ready, (-score, self._next_tie(), domain))
+        self._domain_state[domain] = "ready"
+
+    def _push_cooling(self, domain: str, cooldown_secs: float) -> None:
+        """Push domain into the Cooling heap."""
+        ready_at = time.monotonic() + cooldown_secs
+        heapq.heappush(self._cooling, (ready_at, self._next_tie(), domain))
+        self._domain_state[domain] = "cooling"
+
+    def _set_empty(self, domain: str) -> None:
+        """Mark domain as Empty."""
+        self._empty.add(domain)
+        self._domain_state[domain] = "empty"
+
+    def _promote_cooling(self) -> None:
+        """Move all expired Cooling domains → Ready."""
+        now = time.monotonic()
+        while self._cooling and self._cooling[0][0] <= now:
+            _, _, domain = heapq.heappop(self._cooling)
+
+            # Only promote if domain still has URLs
+            if self._domain_queues.get(domain):
+                self._push_ready(domain)
+                self._promotions += 1
+            else:
+                self._set_empty(domain)
+
+    # ── Core API ──
 
     async def add_url(
         self, url: str, depth: int = 0, priority: float = 0.0
@@ -167,9 +232,13 @@ class MemoryFrontier(AbstractFrontier):
             heapq.heappush(self._domain_queues[domain], crawl_url)
             self._pending_count += 1
 
-            if domain not in self._active_domain_set:
-                self._active_domains.append(domain)
-                self._active_domain_set.add(domain)
+            # State transition: if domain was Empty → move to Ready
+            state = self._domain_state.get(domain)
+            if state is None or state == "empty":
+                self._empty.discard(domain)
+                self._push_ready(domain)
+            # If Cooling: stays Cooling (will promote when cooldown expires)
+            # If Ready: stays Ready (already in heap)
 
             return True
 
@@ -181,19 +250,13 @@ class MemoryFrontier(AbstractFrontier):
         return count
 
     async def get_next(self) -> Optional[CrawlURL]:
-        """Get the next URL to crawl, skipping cooldown domains.
+        """Get the next URL to crawl.
 
-        Strategy:
-          1. Round-robin across active domains
-          2. Skip domains with empty queues (they keep their position
-             so high-yield domains aren't demoted to the back)
-          3. For each domain with URLs, check cooldown (coarse estimate)
-          4. If in cooldown, skip and try next
-          5. If ALL domains are in cooldown, return the one with the
-             shortest remaining cooldown (minimize worker idle time)
-
-        Returns:
-            A CrawlURL if available, None if frontier is empty.
+        O(log N) — no domain scanning needed:
+          1. Promote expired Cooling → Ready
+          2. Pop highest-yield domain from Ready heap
+          3. Pop URL from that domain's queue
+          4. Move domain → Cooling (or Empty if queue exhausted)
         """
         t_wait_start = time.monotonic()
         async with self._lock:
@@ -201,60 +264,64 @@ class MemoryFrontier(AbstractFrontier):
             self._lock_wait_total += t_acquired - t_wait_start
             self._lock_acquisitions += 1
 
-            num_domains = len(self._active_domains)
-            if num_domains == 0:
-                self._lock_hold_total += time.monotonic() - t_acquired
-                return None
+            # Step 1: promote expired cooling domains
+            self._promote_cooling()
 
-            best_cooldown_wait: float = float("inf")
-            best_cooldown_domain: Optional[str] = None
-            empty_count = 0
-
-            tried = 0
-            while tried < num_domains:
-                domain = self._active_domains[0]
-                self._active_domains.rotate(-1)
-                tried += 1
+            # Step 2: find a ready domain with URLs
+            # (stale entries in heap are possible if yield scores changed)
+            while self._ready:
+                neg_score, _, domain = heapq.heappop(self._ready)
 
                 queue = self._domain_queues.get(domain)
                 if not queue:
-                    empty_count += 1
+                    # Domain was emptied by another path — mark empty
+                    self._set_empty(domain)
                     continue
 
-                # ── Cooldown check (coarse, lock-free) ──
-                if self._cooldown_checker:
-                    remaining = self._cooldown_checker(domain)
-                    if remaining > 0.1:  # >100ms cooldown → skip
-                        self._cooldown_skips += 1
-                        if remaining < best_cooldown_wait:
-                            best_cooldown_wait = remaining
-                            best_cooldown_domain = domain
-                        continue
+                # Check if this entry is stale (domain moved to cooling/empty)
+                if self._domain_state.get(domain) != "ready":
+                    continue
 
-                # ── Domain is ready → dequeue ──
+                # Step 3: pop URL from domain's queue
                 item = heapq.heappop(queue)
                 self._pending_count -= 1
-                # DON'T remove domain from deque — keep its position
-                # so it isn't demoted to the back when new URLs arrive
+
+                # Step 4: transition domain state
+                if queue:
+                    # Domain still has URLs → move to Cooling
+                    cooldown = _DEFAULT_COOLDOWN
+                    if self._cooldown_checker:
+                        cooldown = max(self._cooldown_checker(domain), _DEFAULT_COOLDOWN)
+                    self._push_cooling(domain, cooldown)
+                else:
+                    # Domain exhausted → Empty
+                    self._set_empty(domain)
+
                 self._lock_hold_total += time.monotonic() - t_acquired
                 return item
 
-            # All domains with URLs are in cooldown — take the one
-            # that will be ready soonest (minimize worker idle time)
-            if best_cooldown_domain:
-                queue = self._domain_queues.get(best_cooldown_domain)
+            # No ready domains — check if any cooling domains exist
+            # If so, pop the soonest one (minimize worker idle time)
+            if self._cooling:
+                _, _, domain = heapq.heappop(self._cooling)
+                queue = self._domain_queues.get(domain)
                 if queue:
                     item = heapq.heappop(queue)
                     self._pending_count -= 1
+                    self._cooldown_skips += 1  # counts as "forced skip of cooldown"
+
+                    if queue:
+                        self._push_cooling(domain, _DEFAULT_COOLDOWN)
+                    else:
+                        self._set_empty(domain)
+
                     self._lock_hold_total += time.monotonic() - t_acquired
                     return item
 
-            # Lazy cleanup: if >50% of deque entries are empty, purge them
-            if empty_count > num_domains * 0.5 and empty_count > 100:
-                self._cleanup_empty_domains()
-
             self._lock_hold_total += time.monotonic() - t_acquired
-            return None  # frontier empty
+            return None  # frontier truly empty
+
+    # ── Metrics ──
 
     async def size(self) -> int:
         return self._pending_count
@@ -263,36 +330,18 @@ class MemoryFrontier(AbstractFrontier):
         return len(self._bloom)
 
     async def domain_count(self) -> int:
-        # Only count domains with pending URLs
         return sum(1 for q in self._domain_queues.values() if q)
-
-    def _cleanup_empty_domains(self) -> None:
-        """Remove domains with no pending URLs from the deque.
-
-        Called lazily when >50% of deque entries are empty.
-        Must be called while holding self._lock.
-        """
-        to_remove = [d for d in self._active_domains
-                     if not self._domain_queues.get(d)]
-        for d in to_remove:
-            self._active_domains.remove(d)
-            self._active_domain_set.discard(d)
-            if d in self._domain_queues:
-                del self._domain_queues[d]
 
     @property
     def cooldown_skips(self) -> int:
-        """Number of times a domain was skipped due to cooldown."""
         return self._cooldown_skips
 
     @property
     def urls_dropped(self) -> int:
-        """Number of URLs dropped due to frontier cap."""
         return self._urls_dropped
 
     @property
     def lock_stats(self) -> dict:
-        """Frontier lock contention statistics."""
         n = max(self._lock_acquisitions, 1)
         return {
             "lock_wait_total": self._lock_wait_total,
@@ -302,15 +351,30 @@ class MemoryFrontier(AbstractFrontier):
             "avg_lock_hold_ms": (self._lock_hold_total / n) * 1000,
         }
 
+    @property
+    def state_stats(self) -> dict:
+        """Three-state distribution."""
+        return {
+            "ready": len(self._ready),
+            "cooling": len(self._cooling),
+            "empty": len(self._empty),
+            "promotions": self._promotions,
+        }
+
+    # ── Checkpoint ──
+
     async def save_checkpoint(self, path: str) -> None:
-        """Serialize frontier state to disk."""
         async with self._lock:
             state = {
                 "bloom": self._bloom,
                 "domain_queues": dict(self._domain_queues),
-                "active_domains": list(self._active_domains),
+                "ready": list(self._ready),
+                "cooling": list(self._cooling),
+                "empty": set(self._empty),
+                "domain_state": dict(self._domain_state),
+                "domain_yield": dict(self._domain_yield),
                 "pending_count": self._pending_count,
-                "domain_priority": dict(self._domain_priority),
+                "tie_counter": self._tie_counter,
             }
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -318,7 +382,6 @@ class MemoryFrontier(AbstractFrontier):
                 pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     async def load_checkpoint(self, path: str) -> None:
-        """Restore frontier state from disk."""
         p = Path(path)
         if not p.exists():
             return
@@ -329,7 +392,13 @@ class MemoryFrontier(AbstractFrontier):
             self._domain_queues = collections.defaultdict(
                 list, state["domain_queues"]
             )
-            self._active_domains = collections.deque(state["active_domains"])
-            self._active_domain_set = set(self._active_domains)
+            self._ready = state.get("ready", [])
+            self._cooling = state.get("cooling", [])
+            self._empty = state.get("empty", set())
+            self._domain_state = state.get("domain_state", {})
+            self._domain_yield = state.get("domain_yield", {})
             self._pending_count = state["pending_count"]
-            self._domain_priority = state.get("domain_priority", {})
+            self._tie_counter = state.get("tie_counter", 0)
+
+            # Re-promote any cooling domains that expired during downtime
+            self._promote_cooling()

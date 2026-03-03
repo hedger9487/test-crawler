@@ -44,3 +44,10 @@ See `config.yaml` for all tunable parameters.
 ## Graceful Shutdown
 
 Press `Ctrl+C` → saves checkpoint → resumes later with `--resume`.
+
+
+保存log跑法 mac:
+script -q main_crawl.log python -m crawler.main --config config.yaml --seeds seeds.txt --concurrency 50
+
+保存log跑法 linux:
+script -q main_crawl.log -c "python -m crawler.main --config config.yaml --seeds seeds.txt --concurrency 50"
