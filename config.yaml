@@ -20,16 +20,16 @@ crawler:
 # ============================================================
 fetcher:
   # Per-request timeout in seconds
-  timeout: 30
+  timeout: 10
 
   # Maximum number of redirects to follow
   max_redirects: 5
 
-  # Total connection pool size
-  connection_pool_size: 100
+  # Total connection pool size (should be >= concurrency)
+  connection_pool_size: 210
 
   # Maximum connections to a single host
-  per_host_connections: 2
+  per_host_connections: 1
 
   # Accepted content types (prefix match)
   accept_content_types:
@@ -53,8 +53,8 @@ politeness:
 # Frontier
 # ============================================================
 frontier:
-  # Bloom filter expected capacity
-  bloom_capacity: 50_000_000
+  # Bloom filter expected capacity (100M for 48h runs ≈ 160MB)
+  bloom_capacity: 100_000_000
 
   # Bloom filter false-positive rate
   bloom_error_rate: 0.001
@@ -67,6 +67,10 @@ frontier:
 
   # Checkpoint file path
   checkpoint_path: "checkpoint.pkl"
+
+  # Maximum pending URLs in frontier (memory safety for 48h runs)
+  # When full, new URLs from low-yield domains are dropped
+  max_pending: 5_000_000
 
 # ============================================================
 # Storage
@@ -86,3 +90,11 @@ logging:
 
   # Stats reporting interval in seconds
   stats_interval: 30
+
+# ============================================================
+# Notification (Discord webhook for crash alerts)
+# ============================================================
+notification:
+  enabled: true
+  # Create a webhook: Server Settings → Integrations → Webhooks → New
+  discord_webhook: "https://discord.com/api/webhooks/1478267061678637147/ZaULPGyjIEzZaH_vJDoJTyJNoqHIteNB4BCAFDdRWQ-pJSDlnuNisKZc1je26Ut2wFNc"

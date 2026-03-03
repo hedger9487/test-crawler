@@ -36,11 +36,12 @@ class PolitenessConfig:
 
 @dataclass(frozen=True)
 class FrontierConfig:
-    bloom_capacity: int = 50_000_000
+    bloom_capacity: int = 100_000_000
     bloom_error_rate: float = 0.001
     max_depth: int = -1
     checkpoint_interval: int = 300
     checkpoint_path: str = "checkpoint.pkl"
+    max_pending: int = 5_000_000  # frontier cap
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,13 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class NotificationConfig:
+    """Crash notification settings (Discord webhook)."""
+    enabled: bool = False
+    discord_webhook: str = ""
+
+
+@dataclass(frozen=True)
 class Config:
     crawler: CrawlerConfig = field(default_factory=CrawlerConfig)
     fetcher: FetcherConfig = field(default_factory=FetcherConfig)
@@ -63,6 +71,7 @@ class Config:
     frontier: FrontierConfig = field(default_factory=FrontierConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    notification: NotificationConfig = field(default_factory=NotificationConfig)
 
 
 def _make_dc(cls, data: dict | None):
@@ -88,4 +97,5 @@ def load_config(path: str | Path) -> Config:
         frontier=_make_dc(FrontierConfig, raw.get("frontier")),
         storage=_make_dc(StorageConfig, raw.get("storage")),
         logging=_make_dc(LoggingConfig, raw.get("logging")),
+        notification=_make_dc(NotificationConfig, raw.get("notification")),
     )

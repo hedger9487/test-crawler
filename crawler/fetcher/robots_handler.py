@@ -28,10 +28,16 @@ _CRAWL_DELAY_RE = re.compile(
     r"^crawl-delay:\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE | re.MULTILINE
 )
 
+# Regex to extract Sitemap URLs from robots.txt
+_SITEMAP_RE = re.compile(
+    r"^sitemap:\s*(https?://\S+)\s*$", re.IGNORECASE | re.MULTILINE
+)
+
 
 class _CachedRobots:
     """A cached robots.txt entry."""
-    __slots__ = ("parser", "fetched_at", "allows_all", "disallows_all", "crawl_delay")
+    __slots__ = ("parser", "fetched_at", "allows_all", "disallows_all",
+                 "crawl_delay", "sitemap_urls")
 
     def __init__(
         self,
@@ -40,12 +46,14 @@ class _CachedRobots:
         allows_all: bool = False,
         disallows_all: bool = False,
         crawl_delay: Optional[float] = None,
+        sitemap_urls: Optional[list[str]] = None,
     ):
         self.parser = parser
         self.fetched_at = fetched_at
         self.allows_all = allows_all
         self.disallows_all = disallows_all
-        self.crawl_delay = crawl_delay  # seconds between requests, if specified
+        self.crawl_delay = crawl_delay
+        self.sitemap_urls = sitemap_urls or []
 
 
 class RobotsHandler:
@@ -167,10 +175,16 @@ class RobotsHandler:
                 parser = RobotFileParser()
                 parser.parse(text.splitlines())
 
-                # Extract Crawl-delay (stdlib doesn't handle this)
+                # Extract Crawl-delay
                 crawl_delay = self._extract_crawl_delay(text, domain)
 
-                return _CachedRobots(parser, now, crawl_delay=crawl_delay)
+                # Extract Sitemap URLs
+                sitemap_urls = _SITEMAP_RE.findall(text)
+                if sitemap_urls:
+                    logger.debug("Found %d sitemap(s) for %s", len(sitemap_urls), domain)
+
+                return _CachedRobots(parser, now, crawl_delay=crawl_delay,
+                                     sitemap_urls=sitemap_urls)
 
         except asyncio.TimeoutError:
             # Timeout → conservative: disallow all
@@ -204,3 +218,73 @@ class RobotsHandler:
     @property
     def cache_size(self) -> int:
         return len(self._cache)
+
+    def get_sitemap_urls(self, domain: str) -> list[str]:
+        """Get sitemap URLs found in this domain's robots.txt.
+
+        Returns a list of sitemap XML URLs (may be empty).
+        Must call is_allowed() first to trigger robots.txt fetch.
+        """
+        cached = self._cache.get(domain)
+        if cached:
+            return cached.sitemap_urls
+        return []
+
+    async def fetch_sitemap(
+        self, sitemap_url: str,
+    ) -> list[str]:
+        """Fetch and parse a sitemap XML, returning ALL page URLs.
+
+        Handles both <urlset> (direct URLs) and <sitemapindex>
+        (links to nested sitemap files).
+
+        Memory is managed by the frontier cap, not here.
+        """
+        if not self._session:
+            return []
+
+        try:
+            async with self._session.get(
+                sitemap_url,
+                timeout=aiohttp.ClientTimeout(total=self._fetch_timeout),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                if resp.status != 200:
+                    return []
+
+                text = await resp.text(errors="replace")
+
+                import xml.etree.ElementTree as ET
+                try:
+                    root = ET.fromstring(text)
+                except ET.ParseError:
+                    return []
+
+                # Check if this is a sitemap index (contains nested sitemaps)
+                nested_sitemaps = []
+                urls = []
+                for elem in root.iter():
+                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    if tag == "loc" and elem.text:
+                        loc = elem.text.strip()
+                        if loc.startswith("http"):
+                            # Heuristic: if URL ends with .xml or contains "sitemap",
+                            # it's likely a nested sitemap
+                            if loc.endswith(".xml") or "sitemap" in loc.lower():
+                                nested_sitemaps.append(loc)
+                            else:
+                                urls.append(loc)
+
+                # If this was a sitemap index, fetch first 3 nested sitemaps
+                if nested_sitemaps and not urls:
+                    for nested in nested_sitemaps[:3]:
+                        nested_urls = await self.fetch_sitemap(nested)
+                        urls.extend(nested_urls)
+
+                logger.debug("Sitemap %s: found %d URLs", sitemap_url, len(urls))
+                return urls
+
+        except Exception as e:
+            logger.debug("Sitemap fetch error for %s: %s", sitemap_url, e)
+            return []

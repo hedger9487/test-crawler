@@ -85,12 +85,14 @@ class MemoryFrontier(AbstractFrontier):
 
     def __init__(
         self,
-        bloom_capacity: int = 50_000_000,
+        bloom_capacity: int = 100_000_000,
         bloom_error_rate: float = 0.001,
         max_depth: int = -1,
+        max_pending: int = 5_000_000,
     ):
         self._bloom = BloomFilter(bloom_capacity, bloom_error_rate)
         self._max_depth = max_depth
+        self._max_pending = max_pending
 
         # domain -> list of CrawlURL (used as a min-heap by depth)
         self._domain_queues: dict[str, list[CrawlURL]] = collections.defaultdict(list)
@@ -109,8 +111,12 @@ class MemoryFrontier(AbstractFrontier):
         # Injected by orchestrator, calls rate_limiter.peek_wait_time()
         self._cooldown_checker: Optional[Callable[[str], float]] = None
 
-        # Profiling: how many domains were skipped due to cooldown
+        # Profiling
         self._cooldown_skips = 0
+        self._lock_wait_total: float = 0.0   # total seconds workers waited for lock
+        self._lock_hold_total: float = 0.0   # total seconds lock was held
+        self._lock_acquisitions: int = 0     # number of get_next() calls
+        self._urls_dropped: int = 0          # URLs skipped due to frontier cap
 
     def set_cooldown_checker(self, checker: Callable[[str], float]) -> None:
         """Inject a function that returns estimated cooldown for a domain.
@@ -132,6 +138,11 @@ class MemoryFrontier(AbstractFrontier):
     async def add_url(
         self, url: str, depth: int = 0, priority: float = 0.0
     ) -> bool:
+        """Add a URL to the frontier.
+
+        Returns True if the URL was newly seen (for discovered count),
+        even if it was dropped due to frontier cap.
+        """
         normalized = normalize_url(url)
         if normalized is None:
             return False
@@ -140,11 +151,16 @@ class MemoryFrontier(AbstractFrontier):
 
         async with self._lock:
             if not self._bloom.add(normalized):
-                return False  # duplicate
+                return False  # duplicate — not new
+
+            # Frontier cap: URL is new (counted as discovered),
+            # but don't queue if we're over capacity
+            if self._pending_count >= self._max_pending:
+                self._urls_dropped += 1
+                return True  # still counts as "discovered"
 
             domain = get_domain(normalized) or "unknown"
 
-            # Priority = depth (BFS: shallow first)
             crawl_url = CrawlURL(
                 url=normalized, domain=domain, depth=depth, priority=float(depth)
             )
@@ -169,22 +185,30 @@ class MemoryFrontier(AbstractFrontier):
 
         Strategy:
           1. Round-robin across active domains
-          2. For each domain, check if it's in cooldown (coarse estimate)
-          3. If in cooldown, skip it and try the next domain
-          4. If ALL domains are in cooldown, return the one with the
-             shortest remaining cooldown (don't waste worker time)
+          2. Skip domains with empty queues (they keep their position
+             so high-yield domains aren't demoted to the back)
+          3. For each domain with URLs, check cooldown (coarse estimate)
+          4. If in cooldown, skip and try next
+          5. If ALL domains are in cooldown, return the one with the
+             shortest remaining cooldown (minimize worker idle time)
 
         Returns:
             A CrawlURL if available, None if frontier is empty.
         """
+        t_wait_start = time.monotonic()
         async with self._lock:
+            t_acquired = time.monotonic()
+            self._lock_wait_total += t_acquired - t_wait_start
+            self._lock_acquisitions += 1
+
             num_domains = len(self._active_domains)
             if num_domains == 0:
+                self._lock_hold_total += time.monotonic() - t_acquired
                 return None
 
-            best_cooldown_url: Optional[CrawlURL] = None
             best_cooldown_wait: float = float("inf")
             best_cooldown_domain: Optional[str] = None
+            empty_count = 0
 
             tried = 0
             while tried < num_domains:
@@ -194,6 +218,7 @@ class MemoryFrontier(AbstractFrontier):
 
                 queue = self._domain_queues.get(domain)
                 if not queue:
+                    empty_count += 1
                     continue
 
                 # ── Cooldown check (coarse, lock-free) ──
@@ -201,7 +226,6 @@ class MemoryFrontier(AbstractFrontier):
                     remaining = self._cooldown_checker(domain)
                     if remaining > 0.1:  # >100ms cooldown → skip
                         self._cooldown_skips += 1
-                        # Track the domain with the shortest cooldown as fallback
                         if remaining < best_cooldown_wait:
                             best_cooldown_wait = remaining
                             best_cooldown_domain = domain
@@ -210,25 +234,26 @@ class MemoryFrontier(AbstractFrontier):
                 # ── Domain is ready → dequeue ──
                 item = heapq.heappop(queue)
                 self._pending_count -= 1
-                if not queue:
-                    self._active_domains.remove(domain)
-                    self._active_domain_set.discard(domain)
-                    del self._domain_queues[domain]
+                # DON'T remove domain from deque — keep its position
+                # so it isn't demoted to the back when new URLs arrive
+                self._lock_hold_total += time.monotonic() - t_acquired
                 return item
 
-            # All domains are in cooldown — dequeue from the one
+            # All domains with URLs are in cooldown — take the one
             # that will be ready soonest (minimize worker idle time)
             if best_cooldown_domain:
                 queue = self._domain_queues.get(best_cooldown_domain)
                 if queue:
                     item = heapq.heappop(queue)
                     self._pending_count -= 1
-                    if not queue:
-                        self._active_domains.remove(best_cooldown_domain)
-                        self._active_domain_set.discard(best_cooldown_domain)
-                        del self._domain_queues[best_cooldown_domain]
+                    self._lock_hold_total += time.monotonic() - t_acquired
                     return item
 
+            # Lazy cleanup: if >50% of deque entries are empty, purge them
+            if empty_count > num_domains * 0.5 and empty_count > 100:
+                self._cleanup_empty_domains()
+
+            self._lock_hold_total += time.monotonic() - t_acquired
             return None  # frontier empty
 
     async def size(self) -> int:
@@ -238,13 +263,44 @@ class MemoryFrontier(AbstractFrontier):
         return len(self._bloom)
 
     async def domain_count(self) -> int:
-        """Number of domains with pending URLs."""
-        return len(self._active_domain_set)
+        # Only count domains with pending URLs
+        return sum(1 for q in self._domain_queues.values() if q)
+
+    def _cleanup_empty_domains(self) -> None:
+        """Remove domains with no pending URLs from the deque.
+
+        Called lazily when >50% of deque entries are empty.
+        Must be called while holding self._lock.
+        """
+        to_remove = [d for d in self._active_domains
+                     if not self._domain_queues.get(d)]
+        for d in to_remove:
+            self._active_domains.remove(d)
+            self._active_domain_set.discard(d)
+            if d in self._domain_queues:
+                del self._domain_queues[d]
 
     @property
     def cooldown_skips(self) -> int:
         """Number of times a domain was skipped due to cooldown."""
         return self._cooldown_skips
+
+    @property
+    def urls_dropped(self) -> int:
+        """Number of URLs dropped due to frontier cap."""
+        return self._urls_dropped
+
+    @property
+    def lock_stats(self) -> dict:
+        """Frontier lock contention statistics."""
+        n = max(self._lock_acquisitions, 1)
+        return {
+            "lock_wait_total": self._lock_wait_total,
+            "lock_hold_total": self._lock_hold_total,
+            "lock_acquisitions": self._lock_acquisitions,
+            "avg_lock_wait_ms": (self._lock_wait_total / n) * 1000,
+            "avg_lock_hold_ms": (self._lock_hold_total / n) * 1000,
+        }
 
     async def save_checkpoint(self, path: str) -> None:
         """Serialize frontier state to disk."""

@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
 Examples:
   python -m crawler.main --config config.yaml --seeds seeds.txt
   python -m crawler.main --resume
-  python -m crawler.main --seeds seeds.txt --concurrency 300 --max-time 3600
+  python -m crawler.main --seeds seeds.txt --concurrency 50 --max-time 3600
         """,
     )
     parser.add_argument(
@@ -83,7 +83,6 @@ def cli_main() -> None:
 
     # Apply CLI overrides
     if args.concurrency:
-        # We need to create a new config with the override
         from crawler.utils.config import CrawlerConfig
         import dataclasses
         new_crawler = dataclasses.replace(config.crawler, concurrency=args.concurrency)
@@ -102,13 +101,30 @@ def cli_main() -> None:
     seeds_path = args.seeds or config.crawler.seeds_file
     seed_urls = load_seeds(seeds_path)
 
-    # Run crawler
+    # Run crawler with crash notification
     orchestrator = CrawlOrchestrator(config)
 
     try:
         asyncio.run(orchestrator.run(seed_urls, resume=args.resume))
     except KeyboardInterrupt:
-        logging.info("Interrupted.")
+        logging.info("Interrupted by user.")
+    except Exception as e:
+        logging.critical("💀 CRAWLER CRASHED: %s: %s", type(e).__name__, e, exc_info=True)
+
+        # Send crash notification via Discord
+        if config.notification.enabled:
+            from crawler.utils.crash_notifier import send_crash_notification
+            send_crash_notification(
+                error=e,
+                webhook_url=config.notification.discord_webhook,
+            )
+        else:
+            logging.warning(
+                "📢 Crash notification NOT sent (notification.enabled=false in config). "
+                "Set notification.enabled=true and provide discord_webhook URL."
+            )
+
+        sys.exit(1)
 
 
 if __name__ == "__main__":

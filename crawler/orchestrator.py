@@ -52,6 +52,10 @@ class CrawlOrchestrator:
         self._storage: Optional[SQLiteStorage] = None
         self._profiler: Optional[CrawlProfiler] = None
 
+        # Sitemap tracking: domains we've already fetched sitemaps for
+        self._sitemap_fetched: set[str] = set()
+        self._sitemap_discovered: int = 0
+
     async def run(self, seed_urls: list[str], resume: bool = False) -> None:
         """Main entry point: initialize, seed, run workers, shutdown."""
         concurrency = self._config.crawler.concurrency
@@ -63,6 +67,7 @@ class CrawlOrchestrator:
             bloom_capacity=self._config.frontier.bloom_capacity,
             bloom_error_rate=self._config.frontier.bloom_error_rate,
             max_depth=self._config.frontier.max_depth,
+            max_pending=self._config.frontier.max_pending,
         )
 
         self._fetcher = AsyncFetcher(
@@ -110,8 +115,23 @@ class CrawlOrchestrator:
 
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
+        self._worker_tasks: list[asyncio.Task] = []
+        self._got_signal = False
+
+        def _handle_signal():
+            if self._got_signal:
+                # Second signal → force exit
+                logger.warning("⚡ Second signal — forcing exit!")
+                import os
+                os._exit(1)
+            self._got_signal = True
+            logger.info("⚡ Shutdown signal — cancelling all workers...")
+            self._shutdown = True
+            for t in self._worker_tasks:
+                t.cancel()
+
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._signal_shutdown)
+            loop.add_signal_handler(sig, _handle_signal)
 
         # ── Load checkpoint or seed ──
         checkpoint_path = self._config.frontier.checkpoint_path
@@ -137,6 +157,7 @@ class CrawlOrchestrator:
             asyncio.create_task(self._worker(i, start_time, max_time))
             for i in range(concurrency)
         ]
+        self._worker_tasks = workers
 
         try:
             await asyncio.gather(*workers)
@@ -191,6 +212,11 @@ class CrawlOrchestrator:
             except Exception as e:
                 logger.debug("Robots check error for %s: %s", crawl_url.url, e)
                 continue
+
+            # ── Phase: Sitemap discovery (once per domain) ──
+            if crawl_url.domain not in self._sitemap_fetched:
+                self._sitemap_fetched.add(crawl_url.domain)
+                await self._try_fetch_sitemap(crawl_url.domain, crawl_url.depth)
 
             # ── Phase: Rate limit wait ──
             self._profiler.worker_set_state(
@@ -263,9 +289,49 @@ class CrawlOrchestrator:
         # Worker done
         self._profiler.worker_set_state(worker_id, "done")
 
+    async def _try_fetch_sitemap(self, domain: str, current_depth: int) -> None:
+        """Fetch sitemap for a domain if declared in robots.txt.
+
+        Strategy: count ALL sitemap URLs as discovered, but only
+        queue 1 URL per new domain (maintains BFS breadth).
+        """
+        try:
+            robots = self._politeness.robots
+            sitemap_xml_urls = robots.get_sitemap_urls(domain)
+            if not sitemap_xml_urls:
+                return
+
+            for surl in sitemap_xml_urls[:3]:  # max 3 sitemaps per domain
+                page_urls = await robots.fetch_sitemap(surl)
+                if not page_urls:
+                    continue
+
+                # Count all as discovered
+                self._sitemap_discovered += len(page_urls)
+
+                # Add to frontier — bloom filter handles dedup,
+                # frontier cap handles memory. The user's idea:
+                # these URLs go into the normal queue and BFS
+                # explores them naturally via round-robin
+                added = await self._frontier.add_urls(
+                    page_urls, depth=current_depth + 1
+                )
+                self._profiler.record_discovered(domain, added, len(page_urls))
+
+                logger.debug(
+                    "Sitemap %s: %d URLs found, %d new added",
+                    surl, len(page_urls), added,
+                )
+        except Exception as e:
+            logger.debug("Sitemap error for %s: %s", domain, e)
+
+
     def _signal_shutdown(self) -> None:
-        logger.info("⚡ Shutdown signal received — finishing current work...")
+        """Legacy shutdown — prefer the inline handler in run()."""
+        logger.info("⚡ Shutdown signal received — cancelling workers...")
         self._shutdown = True
+        for t in getattr(self, '_worker_tasks', []):
+            t.cancel()
 
     async def _checkpoint_loop(self, path: str) -> None:
         """Periodically save frontier state."""

@@ -232,6 +232,9 @@ class CrawlProfiler:
         # Sync frontier stats
         if self._frontier_ref:
             self._frontier_cooldown_skips = self._frontier_ref.cooldown_skips
+            frontier_dropped = getattr(self._frontier_ref, 'urls_dropped', 0)
+        else:
+            frontier_dropped = 0
 
         elapsed = time.monotonic() - self._start_time
         hours = int(elapsed // 3600)
@@ -247,15 +250,11 @@ class CrawlProfiler:
         worker_states = collections.Counter(
             snap.state for snap in self._worker_states.values()
         )
-        active_pct = (
-            (worker_states.get("fetching", 0) + worker_states.get("parsing", 0))
-            / max(self._num_workers, 1) * 100
-        )
-        waiting_rate_pct = worker_states.get("waiting_rate_limit", 0) / max(self._num_workers, 1) * 100
-        idle_pct = (
-            (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0))
-            / max(self._num_workers, 1) * 100
-        )
+        n = max(self._num_workers, 1)
+        active_pct = (worker_states.get("fetching", 0) + worker_states.get("parsing", 0)) / n * 100
+        waiting_robots_pct = worker_states.get("waiting_robots", 0) / n * 100
+        waiting_rate_pct = worker_states.get("waiting_rate_limit", 0) / n * 100
+        idle_pct = (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0)) / n * 100
 
         # Latency percentiles
         recent_latencies = self._latencies[-1000:]  # last 1000 for recency
@@ -289,6 +288,7 @@ class CrawlProfiler:
 
   🔗 DISCOVERY
     New URLs:     {self._urls_discovered:>10,}
+    Dropped:      {frontier_dropped:>10,}   (frontier cap reached)
     Yield/page:   {discovery_rate:>10.1f}   (new URLs per successful page)
     Domains:      {len(self._domain_crawl_count):>10,}
 
@@ -297,10 +297,12 @@ class CrawlProfiler:
 
   👷 WORKERS ({self._num_workers} total)
     Active:       {active_pct:>8.1f}%   (fetching/parsing)
+    Robots:       {waiting_robots_pct:>8.1f}%   (waiting for robots.txt)
     Rate wait:    {waiting_rate_pct:>8.1f}%
     Idle:         {idle_pct:>8.1f}%
     Avg wait:     {avg_rate_wait:>8.2f}s per acquire
     CD skips:     {self._frontier_cooldown_skips:>8,}   (frontier skipped cooling domains)
+    Conn errs:    {self._status_counts.get(0, 0):>8,}   (status=0, network failures)
 
   📈 STATUS CODES
     {status_str}
@@ -364,14 +366,51 @@ class CrawlProfiler:
 
     @property
     def summary(self) -> dict:
+        """Comprehensive summary for benchmark comparison."""
         elapsed = time.monotonic() - self._start_time
+        total_crawled = max(self._urls_crawled, 1)
+        conn_errors = self._status_counts.get(0, 0)
+
+        # Worker state time-weighted averages (approximate from snapshots)
+        worker_states = collections.Counter(
+            snap.state for snap in self._worker_states.values()
+        )
+        n = max(self._num_workers, 1)
+
+        # Frontier lock stats
+        frontier_lock = {}
+        if self._frontier_ref and hasattr(self._frontier_ref, 'lock_stats'):
+            frontier_lock = self._frontier_ref.lock_stats
+
         return {
+            # Throughput
             "crawled": self._urls_crawled,
             "success": self._urls_success,
             "errors": self._urls_error,
+            "timeouts": self._urls_timeout,
             "discovered": self._urls_discovered,
             "robots_blocked": self._robots_blocked,
             "elapsed_seconds": elapsed,
             "qps": self._urls_crawled / elapsed if elapsed > 0 else 0.0,
-            "success_rate": self._urls_success / max(self._urls_crawled, 1),
+            "success_rate": self._urls_success / total_crawled,
+            # Effective QPS = only counting successful fetches
+            "effective_qps": self._urls_success / elapsed if elapsed > 0 else 0.0,
+            # Latency
+            "p50_ms": self._percentile(self._latencies, 50),
+            "p95_ms": self._percentile(self._latencies, 95),
+            "p99_ms": self._percentile(self._latencies, 99),
+            # Connection health
+            "conn_errors": conn_errors,
+            "conn_error_pct": conn_errors / total_crawled * 100,
+            "timeout_pct": self._urls_timeout / total_crawled * 100,
+            # Worker utilization
+            "active_pct": (worker_states.get("fetching", 0) + worker_states.get("parsing", 0)) / n * 100,
+            "robots_pct": worker_states.get("waiting_robots", 0) / n * 100,
+            "rate_wait_pct": worker_states.get("waiting_rate_limit", 0) / n * 100,
+            "idle_pct": (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0)) / n * 100,
+            # Rate limiter
+            "avg_rate_wait_s": self._total_rate_wait / max(self._rate_wait_count, 1),
+            # Frontier lock
+            "frontier_lock": frontier_lock,
+            "cd_skips": self._frontier_cooldown_skips,
         }
