@@ -18,10 +18,11 @@ import asyncio
 import collections
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +77,18 @@ class CrawlProfiler:
         # ── Domain-level stats ──
         # domain -> number of total crawl attempts (success + failure)
         self._domain_crawl_count: Dict[str, int] = collections.defaultdict(int)
-        # domain -> total new URLs discovered from crawled pages
-        self._domain_crawl_yield: Dict[str, int] = collections.defaultdict(int)
+        # domain -> new internal URLs discovered (same domain as the crawled page)
+        self._domain_yield_internal: Dict[str, int] = collections.defaultdict(int)
+        # domain -> new external URLs discovered (different domain from the crawled page)
+        self._domain_yield_external: Dict[str, int] = collections.defaultdict(int)
         # domain -> total fetch time in seconds (accumulated across all attempts)
         self._domain_total_time_s: Dict[str, float] = collections.defaultdict(float)
         # domain -> number of errors
         self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
         # domain -> number of robots.txt blocks
         self._domain_robots_blocked: Dict[str, int] = collections.defaultdict(int)
+        # domain -> set of distinct domains that have linked to it (in-degree referrers)
+        self._domain_in_degree_referrers: Dict[str, Set[str]] = collections.defaultdict(set)
 
         # ── Latency tracking (in ms) ──
         self._latencies: collections.deque = collections.deque(maxlen=10_000)
@@ -150,11 +155,30 @@ class CrawlProfiler:
             self._latencies.append(latency_ms)
 
     def record_discovered(
-        self, domain: str, new_count: int, total_links: int,
+        self, domain: str, internal_new: int, external_new: int,
     ) -> None:
-        """Record URLs discovered from a crawled page."""
-        self._urls_discovered += new_count
-        self._domain_crawl_yield[domain] += new_count
+        """Record URLs discovered from a crawled page.
+
+        Args:
+            domain:       The domain whose page was crawled.
+            internal_new: New URLs pointing to the same domain (same-site links).
+            external_new: New URLs pointing to other domains (cross-site links).
+        """
+        self._urls_discovered += internal_new + external_new
+        self._domain_yield_internal[domain] += internal_new
+        self._domain_yield_external[domain] += external_new
+
+    def record_outlinks(
+        self, source_domain: str, dest_domains: Set[str],
+    ) -> None:
+        """Record that source_domain linked to each domain in dest_domains.
+
+        Updates in-degree referrers for each destination, enabling
+        authority scoring via log10(10 + in_degree).
+        """
+        for dest in dest_domains:
+            if dest and dest != source_domain:
+                self._domain_in_degree_referrers[dest].add(source_domain)
 
     def record_robots_blocked(self, domain: str) -> None:
         self._robots_blocked += 1
@@ -171,41 +195,60 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """URLs discovered per second of total fetch time.
+        """Compute scheduling priority score for a domain.
 
-        score = Y / T  =  total_discovered / total_time_spent_seconds
+        score = Y_weighted / T  ×  log10(10 + I)
 
-        Mathematically equivalent to:
-            (discovered / attempts) / (time / attempts)
-          = ypc / avg_latency
+          Y_weighted = Y_ext × 10 + Y_int
+            External links are weighted 10× higher than internal links:
+            a domain that consistently links OUT to other sites is a
+            hub — more valuable for broad discovery than a deep-nesting
+            site that only links to itself.
 
-        This naturally captures both dimensions:
-          - Yield rate: domains that discover more URLs per page rank higher.
-          - Speed:      faster domains rank higher than equally-yielding slow ones.
-          - Failures:   timeouts burn time (large T) without producing URLs (Y=0),
-                        so error-heavy domains are penalised without any extra term.
+          T = total fetch time (seconds) across all attempts
+            Failed attempts / timeouts burn T without contributing to Y,
+            so error-heavy domains are penalised automatically.
 
-        Returns 1.0 for unexplored domains (neutral / will enter Explore tier).
+          I = in-degree (number of distinct domains that link to this one)
+            log10(10 + I) gives diminishing-return authority boost:
+              I=0  → 1.0×,  I=90  → 2.0×,  I=990  → 3.0×
+
+        Returns 1.0 for unexplored domains (neutral / Explore tier entry).
         """
         total_time_s = self._domain_total_time_s.get(domain, 0.0)
         if total_time_s == 0.0:
             return 1.0  # unexplored — neutral score, will enter Explore tier anyway
 
-        crawl_yield = self._domain_crawl_yield.get(domain, 0)
-        return crawl_yield / total_time_s
+        y_int = self._domain_yield_internal.get(domain, 0)
+        y_ext = self._domain_yield_external.get(domain, 0)
+        weighted_yield = y_ext * 10 + y_int
+
+        referrers = self._domain_in_degree_referrers.get(domain, set())
+        authority = math.log10(10 + len(referrers))
+
+        return (weighted_yield / total_time_s) * authority
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
-        """Get top N domains by URLs discovered per second."""
+        """Get top N domains by score (weighted URLs/sec × authority)."""
+        all_domains = (
+            set(self._domain_crawl_count)
+            | set(self._domain_yield_internal)
+            | set(self._domain_yield_external)
+        )
         scored = []
-        for domain in set(self._domain_crawl_count) | set(self._domain_crawl_yield):
+        for domain in all_domains:
             crawls = self._domain_crawl_count.get(domain, 0)
-            crawl_yielded = self._domain_crawl_yield.get(domain, 0)
+            y_int = self._domain_yield_internal.get(domain, 0)
+            y_ext = self._domain_yield_external.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
+            in_degree = len(self._domain_in_degree_referrers.get(domain, set()))
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
-                "yield": crawl_yielded,
+                "yield_int": y_int,
+                "yield_ext": y_ext,
                 "errors": errors,
+                "in_degree": in_degree,
                 "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         scored.sort(key=lambda x: x["urls_per_sec"], reverse=True)
@@ -216,12 +259,13 @@ class CrawlProfiler:
         rows = []
         for domain, crawls in self._domain_crawl_count.items():
             success = self._status_by_domain[domain].get(200, 0)
-            crawl_yielded = self._domain_crawl_yield.get(domain, 0)
+            in_degree = len(self._domain_in_degree_referrers.get(domain, set()))
             rows.append({
                 "domain": domain,
                 "crawls": crawls,
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
+                "in_degree": in_degree,
                 "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
@@ -381,16 +425,22 @@ class CrawlProfiler:
   🏆 TOP DOMAINS (by URLs/sec)"""
 
         for d in top_domains:
-            report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
+            report += (
+                f"\n    {d['domain'][:33]:<33} "
+                f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
+                f"in⇐:{d['in_degree']:>4}  "
+                f"crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
+            )
 
         report += f"""
 
   🔢 TOP CRAWLED DOMAINS"""
         for d in top_crawled:
             report += (
-                f"\n    {d['domain'][:35]:<35} "
+                f"\n    {d['domain'][:33]:<33} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
+                f"in⇐:{d['in_degree']:>4}  "
                 f"ups:{d['urls_per_sec']:>6.2f}"
             )
 

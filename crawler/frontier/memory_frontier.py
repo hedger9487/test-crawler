@@ -379,8 +379,13 @@ class MemoryFrontier(AbstractFrontier):
 
         domain = get_domain(normalized) or "unknown"
 
+        # url_depth: count slashes in the full URL as a proxy for path nesting.
+        # e.g. https://example.com/a/b/c  → 5 slashes
+        # Shallow URLs (homepage, top-level sections) are preferred within a domain.
+        url_depth = normalized.count("/")
+
         crawl_url = CrawlURL(
-            url=normalized, domain=domain, depth=depth, priority=float(depth)
+            url=normalized, domain=domain, depth=depth, url_depth=url_depth,
         )
         heapq.heappush(self._domain_queues[domain], crawl_url)
         self._pending_count += 1

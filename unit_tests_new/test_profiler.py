@@ -29,16 +29,72 @@ def test_score_is_zero_when_domain_has_attempts_but_no_yield():
 
 
 def test_score_equals_yield_divided_by_total_time():
-    """score = total_discovered_urls / total_fetch_time_seconds."""
+    """score = Y_weighted / T × authority  (with no in-degree authority=1.0)."""
     p = _make_profiler()
     # 3 attempts × 1 000 ms each → total_time_s = 3.0
     for _ in range(3):
         p.record_fetch("a.com", status=200, latency_ms=1_000.0, is_html=True)
-    # 6 new URLs discovered total
-    p.record_discovered("a.com", new_count=6, total_links=10)
+    # 6 internal URLs discovered, no external, no in-degree → authority = log10(10) = 1.0
+    p.record_discovered("a.com", internal_new=6, external_new=0)
 
-    expected = 6 / 3.0  # = 2.0
+    # Y_weighted = 6*1 + 0*10 = 6 ; authority = 1.0
+    expected = 6 / 3.0 * 1.0  # = 2.0
     assert p.get_domain_score("a.com") == pytest.approx(expected)
+
+
+def test_external_links_weighted_10x_over_internal():
+    """
+    Two domains with identical latency and total link count:
+    the one that discovered external links scores 10× higher than
+    the pure-internal domain (same time, same total yield, no in-degree).
+    """
+    import math
+    p = _make_profiler()
+
+    # hub.com: 1 s fetch, 5 external URLs discovered
+    p.record_fetch("hub.com", status=200, latency_ms=1_000.0, is_html=True)
+    p.record_discovered("hub.com", internal_new=0, external_new=5)
+
+    # silo.com: 1 s fetch, 5 internal URLs discovered
+    p.record_fetch("silo.com", status=200, latency_ms=1_000.0, is_html=True)
+    p.record_discovered("silo.com", internal_new=5, external_new=0)
+
+    # hub.com: Y_weighted = 5*10 = 50, silo.com: Y_weighted = 5*1 = 5
+    assert p.get_domain_score("hub.com") == pytest.approx(
+        (50 / 1.0) * math.log10(10)
+    )
+    assert p.get_domain_score("silo.com") == pytest.approx(
+        (5 / 1.0) * math.log10(10)
+    )
+    assert p.get_domain_score("hub.com") == pytest.approx(
+        p.get_domain_score("silo.com") * 10
+    )
+
+
+def test_in_degree_authority_boosts_score():
+    """
+    Two domains with identical yield and latency:
+    the one with more in-degree referrers scores higher.
+    """
+    import math
+    p = _make_profiler()
+
+    for domain in ("popular.com", "unknown.com"):
+        p.record_fetch(domain, status=200, latency_ms=1_000.0, is_html=True)
+        p.record_discovered(domain, internal_new=5, external_new=0)
+
+    # popular.com has 90 referrers → authority = log10(100) = 2.0
+    p.record_outlinks("ref1.com", {"popular.com"})
+    for i in range(2, 91):  # +89 more distinct referrers
+        p.record_outlinks(f"ref{i}.com", {"popular.com"})
+
+    score_popular = p.get_domain_score("popular.com")
+    score_unknown = p.get_domain_score("unknown.com")
+
+    assert score_popular > score_unknown, (
+        "popular.com (in-degree=90, authority=2.0) must outrank unknown.com (in-degree=0, authority=1.0)"
+    )
+    assert score_popular == pytest.approx(score_unknown * 2.0, rel=1e-3)
 
 
 def test_faster_domain_scores_higher_than_slower_equal_yield_domain():
@@ -48,30 +104,28 @@ def test_faster_domain_scores_higher_than_slower_equal_yield_domain():
     """
     p = _make_profiler()
 
-    # fast.com: 1 crawl in 100 ms, discovers 10 URLs → score = 10 / 0.1 = 100
     p.record_fetch("fast.com", status=200, latency_ms=100.0, is_html=True)
-    p.record_discovered("fast.com", new_count=10, total_links=15)
+    p.record_discovered("fast.com", internal_new=10, external_new=0)
 
-    # slow.com: 1 crawl in 2 000 ms, same 10 URLs → score = 10 / 2.0 = 5
     p.record_fetch("slow.com", status=200, latency_ms=2_000.0, is_html=True)
-    p.record_discovered("slow.com", new_count=10, total_links=15)
+    p.record_discovered("slow.com", internal_new=10, external_new=0)
 
     assert p.get_domain_score("fast.com") > p.get_domain_score("slow.com")
 
 
 def test_timeout_burns_time_without_yield_and_lowers_score():
     """
-    A domain that first had good yield, then starts timing out:
-    subsequent timeouts accumulate time without yield → score falls.
+    A timeout adds to total_time_s without contributing yield.
+    Score after timeout must be lower than score before the timeout.
     """
     p = _make_profiler()
 
-    # Good crawl: 200 ms, 5 URLs
-    p.record_fetch("spotty.com", status=200, latency_ms=200.0, is_html=True)
-    p.record_discovered("spotty.com", new_count=5, total_links=8)
+    # Establish a baseline score for spotty.com with one successful crawl
+    p.record_fetch("spotty.com", status=200, latency_ms=500.0, is_html=True)
+    p.record_discovered("spotty.com", internal_new=5, external_new=0)
     score_before = p.get_domain_score("spotty.com")
 
-    # Timeout: 10 000 ms, no yield
+    # Now a timeout: adds 10 000 ms to denominator, no yield
     p.record_fetch("spotty.com", status=0, latency_ms=10_000.0,
                    is_html=False, error="timeout")
     score_after = p.get_domain_score("spotty.com")
@@ -90,11 +144,11 @@ def test_failed_requests_penalise_score_via_denominator():
 
     # clean.com: 1 successful crawl, 5 URLs, 500 ms
     p.record_fetch("clean.com", status=200, latency_ms=500.0, is_html=True)
-    p.record_discovered("clean.com", new_count=5, total_links=8)
+    p.record_discovered("clean.com", internal_new=5, external_new=0)
 
-    # spotty.com: same 1 successful crawl + 1 failure (additional 500 ms)
+    # spotty.com: same successful crawl + 1 failure (additional 500 ms)
     p.record_fetch("spotty.com", status=200, latency_ms=500.0, is_html=True)
-    p.record_discovered("spotty.com", new_count=5, total_links=8)
+    p.record_discovered("spotty.com", internal_new=5, external_new=0)
     p.record_fetch("spotty.com", status=503, latency_ms=500.0, is_html=False)
 
     assert p.get_domain_score("clean.com") > p.get_domain_score("spotty.com")
@@ -131,11 +185,12 @@ def test_record_fetch_increments_timeout_counter():
 def test_record_discovered_accumulates_across_multiple_calls():
     p = _make_profiler()
     p.record_fetch("multi.com", status=200, latency_ms=200.0, is_html=True)
-    p.record_discovered("multi.com", new_count=3, total_links=5)
-    p.record_discovered("multi.com", new_count=7, total_links=10)
+    p.record_discovered("multi.com", internal_new=3, external_new=0)
+    p.record_discovered("multi.com", internal_new=0, external_new=7)
 
-    # total discovered = 10
-    assert p._domain_crawl_yield["multi.com"] == 10
+    # total discovered = 10 (3 internal + 7 external)
+    assert p._domain_yield_internal["multi.com"] == 3
+    assert p._domain_yield_external["multi.com"] == 7
     assert p.summary["discovered"] == 10
 
 
@@ -155,17 +210,14 @@ def test_record_fetch_accumulates_time_across_attempts():
 def test_get_top_domains_sorted_by_urls_per_sec_descending():
     p = _make_profiler()
 
-    # a.com: 5 URLs in 1 s  → ups = 5.0
     p.record_fetch("a.com", status=200, latency_ms=1_000.0, is_html=True)
-    p.record_discovered("a.com", new_count=5, total_links=8)
+    p.record_discovered("a.com", internal_new=5, external_new=0)
 
-    # b.com: 20 URLs in 1 s → ups = 20.0
     p.record_fetch("b.com", status=200, latency_ms=1_000.0, is_html=True)
-    p.record_discovered("b.com", new_count=20, total_links=25)
+    p.record_discovered("b.com", internal_new=20, external_new=0)
 
-    # c.com: 1 URL in 1 s  → ups = 1.0
     p.record_fetch("c.com", status=200, latency_ms=1_000.0, is_html=True)
-    p.record_discovered("c.com", new_count=1, total_links=3)
+    p.record_discovered("c.com", internal_new=1, external_new=0)
 
     results = p.get_top_domains(10)
     domains = [r["domain"] for r in results]
@@ -175,17 +227,17 @@ def test_get_top_domains_sorted_by_urls_per_sec_descending():
 def test_get_top_domains_row_contains_expected_keys():
     p = _make_profiler()
     p.record_fetch("x.com", status=200, latency_ms=500.0, is_html=True)
-    p.record_discovered("x.com", new_count=2, total_links=3)
+    p.record_discovered("x.com", internal_new=2, external_new=0)
 
     row = p.get_top_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "yield", "errors", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "in_degree", "urls_per_sec"}
 
 
 def test_get_top_domains_n_limits_results():
     p = _make_profiler()
     for i in range(10):
         p.record_fetch(f"d{i}.com", status=200, latency_ms=100.0, is_html=True)
-        p.record_discovered(f"d{i}.com", new_count=i + 1, total_links=20)
+        p.record_discovered(f"d{i}.com", internal_new=i + 1, external_new=0)
 
     assert len(p.get_top_domains(3)) == 3
 
@@ -209,7 +261,7 @@ def test_get_most_crawled_domains_row_contains_expected_keys():
     p.record_fetch("k.com", status=200, latency_ms=300.0, is_html=True)
 
     row = p.get_most_crawled_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "in_degree", "urls_per_sec"}
 
 
 def test_get_most_crawled_domains_success_rate_calculation():

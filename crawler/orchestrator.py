@@ -284,12 +284,34 @@ class CrawlOrchestrator:
                     )
                     try:
                         links = extract_links(result.html, crawl_url.url)
-                        new_count = await self._frontier.add_urls(
-                            links, depth=crawl_url.depth + 1
+                        source_domain = crawl_url.domain
+                        next_depth = crawl_url.depth + 1
+
+                        # Split discovered links into internal (same domain) and
+                        # external (other domains) before enqueueing.
+                        internal_links = [l for l in links if get_domain(l) == source_domain]
+                        external_links = [l for l in links if get_domain(l) != source_domain]
+
+                        internal_new = (
+                            await self._frontier.add_urls(internal_links, depth=next_depth)
+                            if internal_links else 0
                         )
+                        external_new = (
+                            await self._frontier.add_urls(external_links, depth=next_depth)
+                            if external_links else 0
+                        )
+
                         self._profiler.record_discovered(
-                            crawl_url.domain, new_count, len(links)
+                            source_domain, internal_new, external_new,
                         )
+
+                        # Record in-degree for each distinct external destination.
+                        ext_dest_domains = {
+                            get_domain(l) for l in external_links if get_domain(l)
+                        }
+                        if ext_dest_domains:
+                            self._profiler.record_outlinks(source_domain, ext_dest_domains)
+
                     except Exception as e:
                         logger.debug("Parse/enqueue error for %s: %s", crawl_url.url, e)
             finally:

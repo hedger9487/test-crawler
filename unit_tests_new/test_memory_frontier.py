@@ -537,3 +537,27 @@ async def test_requeued_url_gets_fresh_issue_time(monkeypatch):
     assert second.issue_time == 2000.0, (
         "Requeued URL must receive a fresh issue_time on re-dispatch"
     )
+
+
+@pytest.mark.asyncio
+async def test_shallow_url_dispatched_before_deep_url_same_domain():
+    """
+    Within the same domain queue, a URL with fewer path segments (lower
+    url_depth) must be dispatched before a deeply nested one.
+    CrawlURL.__lt__ uses (depth, url_depth) so shallower URLs sort first.
+    """
+    frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
+    frontier.set_cooldown_checker(lambda _: 0.0)
+
+    # Add deep URL first to ensure ordering is not insertion-order
+    await frontier.add_url("https://example.com/a/b/c/d/e/deep-page")  # 7 slashes
+    await frontier.add_url("https://example.com/shallow")               # 3 slashes
+
+    item = await frontier.get_next()
+    assert item is not None
+    assert "shallow" in item.url, (
+        f"Shallow URL must be dispatched first, got: {item.url}"
+    )
+    assert item.url_depth < 7, (
+        f"url_depth should be low for shallow URL, got {item.url_depth}"
+    )
