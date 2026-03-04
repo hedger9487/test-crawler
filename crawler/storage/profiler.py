@@ -172,40 +172,24 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """Get a yield-based score for a domain. Higher = better for discovery.
+        """Compute YPC × success_rate for a domain.
 
-        Uses crawl yield (URLs discovered per page), with graduated penalties
-        for robots-blocked and high-error domains.
+        = (discovered / crawls) × (successes / crawls)
+        = avg new URLs returned per request issued (regardless of outcome).
+
+        Returns 1.0 for unexplored domains (neutral / explore-first).
+        Returns 0.0 if the domain has never returned a 200.
         """
         crawls = self._domain_crawl_count.get(domain, 0)
+        if crawls == 0:
+            return 1.0  # unexplored — neutral score, will enter Explore tier anyway
+
         crawl_yield = self._domain_crawl_yield.get(domain, 0)
-        errors = self._domain_error_count.get(domain, 0)
-        blocked = self._domain_robots_blocked.get(domain, 0)
+        success = self._status_by_domain[domain].get(200, 0)
 
-        # Total attempts = crawls + robots blocked
-        total_attempts = crawls + blocked
-
-        if total_attempts == 0:
-            return 1.0  # Unknown domains get a neutral score (explore)
-
-        # Robots blocked penalty (graduated)
-        blocked_ratio = blocked / total_attempts
-        if blocked_ratio > 0.9:
-            return -1.0  # Almost entirely blocked → deprioritize hard
-        elif blocked_ratio > 0.5:
-            # Graduated: 50% blocked → 0.5x, 90% blocked → 0.1x
-            penalty = 1.0 - blocked_ratio
-        else:
-            penalty = 1.0
-
-        # Error penalty
-        error_rate = errors / max(crawls, 1)
-        if error_rate > 0.8:
-            return -1.0  # Mostly errors → deprioritize
-
-        # Crawl yield per crawl
-        base_score = crawl_yield / (crawls + 1)
-        return base_score * penalty
+        ypc = crawl_yield / crawls
+        success_rate = success / crawls
+        return ypc * success_rate
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
         """Get top N domains by crawl yield per crawl."""
@@ -231,11 +215,13 @@ class CrawlProfiler:
         rows = []
         for domain, crawls in self._domain_crawl_count.items():
             success = self._status_by_domain[domain].get(200, 0)
+            crawl_yielded = self._domain_crawl_yield.get(domain, 0)
             rows.append({
                 "domain": domain,
                 "crawls": crawls,
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
+                "ypc": crawl_yielded / crawls if crawls > 0 else 0.0,
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
         return rows[:n]
@@ -404,8 +390,8 @@ class CrawlProfiler:
             report += (
                 f"\n    {d['domain'][:35]:<35} "
                 f"crawls:{d['crawls']:>5}  "
-                f"200:{d['success']:>5}  "
-                f"succ:{d['success_rate']:>5.1f}%"
+                f"succ:{d['success_rate']:>5.1f}%  "
+                f"ypc:{d['ypc']:>6.1f}"
             )
 
         report += f"\n{sep}"

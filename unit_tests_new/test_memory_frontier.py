@@ -6,11 +6,10 @@ import time
 import crawler.frontier.memory_frontier as frontier_module
 from crawler.frontier.memory_frontier import (
     MemoryFrontier,
-    _NEW_DOMAIN_PRIORITY,
-    _WARMUP_DOMAIN_PRIORITY,
-    _MAX_YPC_PRIORITY,
-    _WARMUP_ISSUE_LIMIT,
-    _NON_NEW_SLOT_EVERY,
+    _EXPLORE_PRIORITY,
+    _EXPLORE_ISSUE_LIMIT,
+    _MAX_SCORE_PRIORITY,
+    _NON_EXPLORE_SLOT_EVERY,
 )
 
 
@@ -146,14 +145,15 @@ async def test_cooling_promotes_back_to_ready_when_time_passes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_new_domain_priority_is_above_mature_ypc_domains():
+async def test_explore_tier_beats_mature_regardless_of_score():
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    # mature.com has high ypc but already out of warm-up.
-    frontier._domain_issue_count["mature.com"] = 3
+    # mature.com has maximum score but is past the explore limit
+    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
     frontier.update_domain_priorities({"mature.com": 999999.0})
 
     await frontier.add_url("https://mature.com/1")
+    # new.com has never been issued (issue_count=0) → Explore tier
     await frontier.add_url("https://new.com/1")
 
     first = await frontier.get_next()
@@ -162,20 +162,21 @@ async def test_new_domain_priority_is_above_mature_ypc_domains():
 
 
 @pytest.mark.asyncio
-async def test_warmup_priority_is_above_any_mature_ypc():
+async def test_explore_tier_covers_all_issue_counts_below_limit():
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    # warm.com has <3 issued so it should beat any mature ypc domain.
-    frontier._domain_issue_count["warm.com"] = 1
-    frontier._domain_issue_count["mature.com"] = 3
-    frontier.update_domain_priorities({"warm.com": -1.0, "mature.com": 999999.0})
+    # Both issue_count=1 and issue_count=2 are still Explore tier
+    # and should beat any Mature domain.
+    frontier._domain_issue_count["partial.com"] = _EXPLORE_ISSUE_LIMIT - 1
+    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
+    frontier.update_domain_priorities({"partial.com": -1.0, "mature.com": 999999.0})
 
-    await frontier.add_url("https://warm.com/1")
+    await frontier.add_url("https://partial.com/1")
     await frontier.add_url("https://mature.com/1")
 
     first = await frontier.get_next()
     assert first is not None
-    assert first.domain == "warm.com"
+    assert first.domain == "partial.com"
 
 
 @pytest.mark.asyncio
@@ -201,23 +202,31 @@ async def test_requeue_issued_url_restores_pending_work():
 
 
 @pytest.mark.asyncio
-async def test_ready_scheduler_reserves_20_percent_for_non_new_domains():
+async def test_slot_enforcement_ensures_mature_domain_dispatched():
+    """Every _NON_EXPLORE_SLOT_EVERY-th dispatch reserves a slot for a Mature
+    domain so Explore-tier domains cannot permanently starve Mature ones."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-    frontier._domain_issue_count["warm.com"] = 1
-    frontier.update_domain_priorities({"warm.com": 0.1})
 
-    await frontier.add_url("https://warm.com/1")
-    await frontier.add_urls(
-        [f"https://new{i}.com/1" for i in range(1, 6)],
-        depth=0,
+    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
+    frontier.update_domain_priorities({"mature.com": 50.0})
+
+    await frontier.add_url("https://mature.com/1")
+    for i in range(_NON_EXPLORE_SLOT_EVERY * 2):
+        await frontier.add_url(f"https://new{i}.com/1")
+
+    dispatched = []
+    for _ in range(_NON_EXPLORE_SLOT_EVERY * 2 + 1):
+        item = await frontier.get_next()
+        if item is None:
+            break
+        dispatched.append(item.domain)
+        await frontier.release_issued_url(item)
+
+    first_batch = set(dispatched[:_NON_EXPLORE_SLOT_EVERY])
+    assert "mature.com" in first_batch, (
+        f"mature.com must appear in first {_NON_EXPLORE_SLOT_EVERY} dispatches; "
+        f"got: {dispatched}"
     )
-
-    first_five = [await frontier.get_next() for _ in range(5)]
-    domains = [item.domain for item in first_five if item is not None]
-
-    assert len(domains) == 5
-    assert domains[-1] == "warm.com"
-    assert "warm.com" not in domains[:4]
 
 
 @pytest.mark.asyncio
@@ -276,51 +285,41 @@ def test_effective_priority_tier_boundaries():
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
     frontier._domain_yield["d"] = 500.0
 
-    # New: issue_count == 0 → always 3M regardless of ypc
-    frontier._domain_issue_count["d"] = 0
-    assert frontier._effective_priority("d") == _NEW_DOMAIN_PRIORITY
+    # Explore: any issue_count < _EXPLORE_ISSUE_LIMIT → always _EXPLORE_PRIORITY
+    for cnt in range(_EXPLORE_ISSUE_LIMIT):
+        frontier._domain_issue_count["d"] = cnt
+        assert frontier._effective_priority("d") == _EXPLORE_PRIORITY, (
+            f"issue_count={cnt} must be Explore tier"
+        )
 
-    # Warmup lower bound: issue_count == 1 → flat 2M
-    frontier._domain_issue_count["d"] = 1
-    assert frontier._effective_priority("d") == _WARMUP_DOMAIN_PRIORITY
+    # Mature entry: issue_count == _EXPLORE_ISSUE_LIMIT → score (capped at _MAX_SCORE_PRIORITY)
+    frontier._domain_issue_count["d"] = _EXPLORE_ISSUE_LIMIT
+    assert frontier._effective_priority("d") == min(500.0, _MAX_SCORE_PRIORITY)
 
-    # Warmup upper bound: issue_count == _WARMUP_ISSUE_LIMIT - 1 → flat 2M
-    frontier._domain_issue_count["d"] = _WARMUP_ISSUE_LIMIT - 1
-    assert frontier._effective_priority("d") == _WARMUP_DOMAIN_PRIORITY
-
-    # Mature entry: issue_count == _WARMUP_ISSUE_LIMIT → ypc score (capped at 1M)
-    frontier._domain_issue_count["d"] = _WARMUP_ISSUE_LIMIT
-    assert frontier._effective_priority("d") == min(500.0, _MAX_YPC_PRIORITY)
-
-    # Mature far: high issue count, ypc below cap → raw ypc returned
+    # Mature: high issue count, score below cap → raw score returned
     frontier._domain_issue_count["d"] = 172
-    frontier._domain_yield["d"] = 28.9
-    assert frontier._effective_priority("d") == 28.9
+    frontier._domain_yield["d"] = 13.1
+    assert frontier._effective_priority("d") == 13.1
 
-    # Mature: ypc above cap → clamped to 1M
+    # Mature: score above cap → clamped
     frontier._domain_yield["d"] = 2_000_000.0
-    assert frontier._effective_priority("d") == _MAX_YPC_PRIORITY
+    assert frontier._effective_priority("d") == _MAX_SCORE_PRIORITY
 
 
-def test_effective_priority_unknown_domain_defaults_to_new():
-    """A domain with no issue_count entry is treated as New (3M)."""
+def test_effective_priority_unknown_domain_defaults_to_explore():
+    """A domain with no issue_count entry is treated as Explore tier."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-    assert frontier._effective_priority("never.seen.com") == _NEW_DOMAIN_PRIORITY
+    assert frontier._effective_priority("never.seen.com") == _EXPLORE_PRIORITY
 
 
-def test_mature_ypc_cap_is_below_warmup():
-    """Even the maximum possible Mature priority must be below Warmup."""
-    assert _MAX_YPC_PRIORITY < _WARMUP_DOMAIN_PRIORITY
-
-
-def test_warmup_is_below_new():
-    """Warmup priority must be below New."""
-    assert _WARMUP_DOMAIN_PRIORITY < _NEW_DOMAIN_PRIORITY
+def test_score_cap_is_below_explore():
+    """Even the maximum possible Mature score must be below Explore priority."""
+    assert _MAX_SCORE_PRIORITY < _EXPLORE_PRIORITY
 
 
 @pytest.mark.asyncio
-async def test_mature_domains_ordered_by_ypc():
-    """Within the Mature tier, higher YPC score must be dispatched first."""
+async def test_mature_domains_ordered_by_score():
+    """Within the Mature tier, higher score (YPC×success_rate) must be dispatched first."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
     for domain, issue_count in [("low.com", 10), ("high.com", 50)]:
@@ -334,32 +333,32 @@ async def test_mature_domains_ordered_by_ypc():
     first = await frontier.get_next()
     assert first is not None
     assert first.domain == "high.com", (
-        "high.com has Mature YPC=80 vs low.com YPC=5; high.com must win"
+        "high.com has Mature score=80 vs low.com score=5; high.com must win"
     )
 
 
 @pytest.mark.asyncio
-async def test_warmup_beats_high_ypc_mature_regardless_of_score():
+async def test_explore_tier_beats_max_score_mature():
     """
-    A Warmup domain (issue_count=1, ypc=0.001) must be dispatched
-    before a Mature domain with the maximum possible YPC score.
-    This is by design: exploration over exploitation in early crawl.
+    An Explore domain (issue_count=1, score=0.001) must be dispatched
+    before a Mature domain with the maximum possible score.
+    This is by design: guarantee early crawls before competing on score.
     """
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    frontier._domain_issue_count["warmup.com"] = 1
+    frontier._domain_issue_count["explore.com"] = 1
     frontier._domain_issue_count["mature.com"] = 172
     frontier.update_domain_priorities({
-        "warmup.com": 0.001,
-        "mature.com": _MAX_YPC_PRIORITY,  # max possible mature priority
+        "explore.com": 0.001,
+        "mature.com": _MAX_SCORE_PRIORITY,
     })
 
-    await frontier.add_url("https://warmup.com/1")
+    await frontier.add_url("https://explore.com/1")
     await frontier.add_url("https://mature.com/1")
 
     first = await frontier.get_next()
     assert first is not None
-    assert first.domain == "warmup.com"
+    assert first.domain == "explore.com"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -407,18 +406,18 @@ async def test_domain_with_internal_links_stays_active():
 
 
 @pytest.mark.asyncio
-async def test_high_crawl_count_mature_domain_ordered_by_ypc():
+async def test_high_crawl_count_mature_domain_ordered_by_score():
     """
-    footystats at crawl_n=172, ypc≈29 must rank BELOW
-    a domain with ypc=90 in the Mature tier.
+    footystats at crawl_n=172, score≈13 must rank BELOW
+    a domain with score=90 in the Mature tier.
     """
     frontier = MemoryFrontier(bloom_capacity=10_000, max_pending=1_000)
 
     frontier._domain_issue_count["footystats.org"] = 172
     frontier._domain_issue_count["better.com"] = 10
     frontier.update_domain_priorities({
-        "footystats.org": 28.9,
-        "better.com": 90.0,
+        "footystats.org": 13.1,   # 28.9 ypc × 45% succ
+        "better.com": 90.0,       # high ypc × good succ
     })
 
     await frontier.add_url("https://footystats.org/x")
@@ -427,7 +426,7 @@ async def test_high_crawl_count_mature_domain_ordered_by_ypc():
     first = await frontier.get_next()
     assert first is not None
     assert first.domain == "better.com", (
-        "better.com (Mature ypc=90) must beat footystats (Mature ypc=28.9)"
+        "better.com (Mature score=90) must beat footystats (Mature score=13.1)"
     )
 
 
@@ -516,44 +515,45 @@ async def test_empty_domain_reactivates_only_when_self_link_added():
 # ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_non_new_slot_targets_issue_count_zero_only():
+async def test_non_explore_slot_skips_all_explore_tier_domains():
     """
-    The 1-in-N enforcement skips domains with issue_count==0 (New tier).
-    It must NOT skip Warmup domains (issue_count 1..2).
-    This tests that warmup domains are NOT penalised by the enforcement.
+    The 1-in-N enforcement skips ALL Explore-tier domains
+    (issue_count < _EXPLORE_ISSUE_LIMIT), including partially-explored ones
+    (issue_count 1, 2), not just brand-new ones (issue_count 0).
+    A Mature domain must appear within the first _NON_EXPLORE_SLOT_EVERY dispatches.
     """
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    # One warmup domain
-    frontier._domain_issue_count["warmup.com"] = 1
+    # Mature domain: should be forced through on the enforcement slot
+    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
+    frontier.update_domain_priorities({"mature.com": 0.1})
 
-    # Fill with New domains to trigger the enforcement
-    new_domains = [f"new{i}.com" for i in range(_NON_NEW_SLOT_EVERY * 2)]
-    for d in new_domains:
+    # Explore-tier mix: issue_count = 0, 1, 2 (all < _EXPLORE_ISSUE_LIMIT)
+    for i, cnt in enumerate([0, 1, 2, 0, 1]):
+        d = f"explore{i}.com"
+        frontier._domain_issue_count[d] = cnt
         await frontier.add_url(f"https://{d}/1")
-    await frontier.add_url("https://warmup.com/1")
+    await frontier.add_url("https://mature.com/1")
 
     dispatched = []
-    for _ in range(_NON_NEW_SLOT_EVERY * 2 + 1):
+    for _ in range(_NON_EXPLORE_SLOT_EVERY + 1):
         item = await frontier.get_next()
         if item is None:
             break
         dispatched.append(item.domain)
-        # Immediately release so domain re-enters the pool
         await frontier.release_issued_url(item)
 
-    # warmup.com must appear within the first _NON_NEW_SLOT_EVERY dispatches
-    first_batch = set(dispatched[:_NON_NEW_SLOT_EVERY])
-    assert "warmup.com" in first_batch, (
-        f"warmup.com must appear in first {_NON_NEW_SLOT_EVERY} dispatches; "
+    first_batch = set(dispatched[:_NON_EXPLORE_SLOT_EVERY])
+    assert "mature.com" in first_batch, (
+        f"mature.com must appear in first {_NON_EXPLORE_SLOT_EVERY} dispatches; "
         f"got: {dispatched}"
     )
 
 
 @pytest.mark.asyncio
-async def test_non_new_slot_does_not_stall_when_only_new_domains_exist():
+async def test_slot_enforcement_falls_back_when_no_mature_domains_exist():
     """
-    If ALL ready domains are New (issue_count==0), the 1-in-N slot enforcement
+    If ALL ready domains are Explore-tier, the 1-in-N slot enforcement
     must fall back and still dispatch one — not return None.
     """
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)

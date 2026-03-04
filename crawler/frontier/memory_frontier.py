@@ -87,14 +87,15 @@ class BloomFilter:
 # Default cooldown when no checker is available (seconds)
 _DEFAULT_COOLDOWN = 2.0
 
-# Queue1 (Ready) scheduling tiers:
-#   New domain (never issued) > Warm-up (<3 issued) > Mature (yield-based)
-_NEW_DOMAIN_PRIORITY = 3_000_000.0
-_WARMUP_DOMAIN_PRIORITY = 2_000_000.0
-_WARMUP_ISSUE_LIMIT = 3
-_MAX_YPC_PRIORITY = 1_000_000.0
-# Enforce at least 20% dispatches from non-new domains when available.
-_NON_NEW_SLOT_EVERY = 5
+# Domain scheduling tiers:
+#   Explore (issue_count < _EXPLORE_ISSUE_LIMIT): guarantee first few crawls
+#   Mature  (issue_count >= _EXPLORE_ISSUE_LIMIT): scored by YPC × success_rate
+_EXPLORE_PRIORITY = 3_000_000.0
+_EXPLORE_ISSUE_LIMIT = 3
+_MAX_SCORE_PRIORITY = 1_000_000.0
+# Every Nth dispatch: reserve one slot for a Mature domain so explore-tier
+# domains cannot permanently starve mature high-score domains.
+_NON_EXPLORE_SLOT_EVERY = 5
 
 
 class MemoryFrontier(AbstractFrontier):
@@ -201,21 +202,23 @@ class MemoryFrontier(AbstractFrontier):
         return self._tie_counter
 
     def _effective_priority(self, domain: str) -> float:
-        """Compute Queue1 priority with strict tiering.
+        """Compute scheduling priority.
 
-        Priority order:
-          1) New domain (issue_count == 0)
-          2) Warm-up domain (issue_count < 3)
-          3) Mature domain (yield-based score)
+        Explore tier (issue_count < _EXPLORE_ISSUE_LIMIT):
+          Flat high priority — every new domain gets its first few crawls
+          before competing on score.
+
+        Mature tier (issue_count >= _EXPLORE_ISSUE_LIMIT):
+          score = YPC × success_rate
+                = (discovered / crawls) × (successes / crawls)
+          = avg new URLs returned per request issued (regardless of outcome).
+          Capped at _MAX_SCORE_PRIORITY to prevent outlier monopoly.
         """
         issue_count = self._domain_issue_count.get(domain, 0)
+        if issue_count < _EXPLORE_ISSUE_LIMIT:
+            return _EXPLORE_PRIORITY
         score = self._domain_yield.get(domain, 1.0)
-
-        if issue_count == 0:
-            return _NEW_DOMAIN_PRIORITY
-        if issue_count < _WARMUP_ISSUE_LIMIT:
-            return _WARMUP_DOMAIN_PRIORITY
-        return min(score, _MAX_YPC_PRIORITY)
+        return min(score, _MAX_SCORE_PRIORITY)
 
     def _push_ready(self, domain: str) -> None:
         """Push domain into the Ready heap."""
@@ -412,7 +415,7 @@ class MemoryFrontier(AbstractFrontier):
 
             # Step 2: find a ready domain with URLs
             # (stale entries in heap are possible if yield scores changed)
-            force_non_new = ((self._ready_dispatch_count + 1) % _NON_NEW_SLOT_EVERY == 0)
+            force_non_new = ((self._ready_dispatch_count + 1) % _NON_EXPLORE_SLOT_EVERY == 0)
             for pass_idx in range(2):
                 enforce_non_new = force_non_new and pass_idx == 0
                 skipped_new: list[tuple[float, int, int, str]] = []
@@ -425,7 +428,7 @@ class MemoryFrontier(AbstractFrontier):
                         self._stale_pops += 1
                         continue
 
-                    if enforce_non_new and self._domain_issue_count.get(domain, 0) == 0:
+                    if enforce_non_new and self._domain_issue_count.get(domain, 0) < _EXPLORE_ISSUE_LIMIT:
                         skipped_new.append((neg_score, gen, tie, domain))
                         continue
 
