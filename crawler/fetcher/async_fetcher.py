@@ -34,6 +34,7 @@ class AsyncFetcher(AbstractFetcher):
         pool_size: int = 100,
         per_host: int = 2,
         accept_content_types: list[str] | None = None,
+        ssl_verify: bool = False,
     ):
         self._user_agent = user_agent
         self._timeout = aiohttp.ClientTimeout(
@@ -44,6 +45,7 @@ class AsyncFetcher(AbstractFetcher):
         self._max_redirects = max_redirects
         self._pool_size = pool_size
         self._per_host = per_host
+        self._ssl = None if ssl_verify else False  # None = default verify, False = skip
         self._accept_types = accept_content_types or [
             "text/html",
             "application/xhtml+xml",
@@ -57,7 +59,7 @@ class AsyncFetcher(AbstractFetcher):
             limit_per_host=self._per_host,
             ttl_dns_cache=300,        # 5 min DNS cache
             enable_cleanup_closed=True,
-            ssl=False,
+            ssl=self._ssl,
         )
         self._session = aiohttp.ClientSession(
             connector=self._connector,

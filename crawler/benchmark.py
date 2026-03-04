@@ -8,6 +8,7 @@ Usage:
     python -m crawler.benchmark --config config.yaml --seeds seeds.txt
     python -m crawler.benchmark --seeds seeds.txt --duration 90
     python -m crawler.benchmark --seeds seeds.txt --concurrency 10,30,50,100,200 --pools 20,60,120,220
+    python -m crawler.benchmark --auto --duration 60 --auto-start 40 --auto-max 1200
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+import yaml
 
 from crawler.orchestrator import CrawlOrchestrator
 from crawler.utils.config import load_config
@@ -87,9 +90,27 @@ async def run_single(
 
     orchestrator = CrawlOrchestrator(cfg)
 
+    async def _progress_ticker():
+        """Print progress every 10s so the terminal doesn't look stuck."""
+        t0_inner = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(10)
+                elapsed_inner = time.monotonic() - t0_inner
+                crawled = orchestrator._profiler._urls_crawled if orchestrator._profiler else 0
+                print(f"    ... {elapsed_inner:.0f}s elapsed, {crawled:,} crawled", flush=True)
+        except asyncio.CancelledError:
+            pass
+
     t0 = time.monotonic()
     try:
+        ticker = asyncio.ensure_future(_progress_ticker())
         await orchestrator.run(seeds, resume=False)
+        ticker.cancel()
+        try:
+            await ticker
+        except asyncio.CancelledError:
+            pass
     except Exception as e:
         print(f"  ⚠ Run failed: {e}")
     elapsed = time.monotonic() - t0
@@ -217,6 +238,60 @@ def print_report(results: list[dict]):
     print()
 
 
+def _row_score(r: dict) -> float:
+    """Throughput score penalized by connection/timeout instability."""
+    health = 1.0 - 0.7 * (r["conn_err_pct"] / 100.0) - 0.3 * (r["timeout_pct"] / 100.0)
+    health = max(0.0, health)
+    return r["eff_qps"] * health
+
+
+def _auto_pool_size(concurrency: int, ratio: float, bias: int) -> int:
+    return max(20, int(concurrency * ratio + bias))
+
+
+def pick_best_result(results: list[dict]) -> tuple[dict, bool]:
+    """Pick best benchmark row. Returns (best_row, is_representative)."""
+    if not results:
+        raise ValueError("results cannot be empty")
+
+    valid = [r for r in results if r["crawled"] > 0]
+    if not valid:
+        # Keep deterministic fallback while flagging this run as non-representative
+        best = max(
+            results,
+            key=lambda r: (r["eff_qps"], -r["conn_err_pct"], -r["timeout_pct"]),
+        )
+        return best, False
+
+    best = max(
+        valid,
+        key=lambda r: (_row_score(r), r["eff_qps"], -r["lock_wait_ms"]),
+    )
+    return best, True
+
+
+def write_recommended_config(
+    base_config_path: str,
+    output_path: str,
+    best: dict,
+) -> None:
+    """Write a config file with recommended worker/pool values."""
+    p = Path(base_config_path)
+    raw = {}
+    if p.exists():
+        raw = yaml.safe_load(p.read_text()) or {}
+
+    raw.setdefault("crawler", {})
+    raw.setdefault("fetcher", {})
+
+    raw["crawler"]["concurrency"] = int(best["concurrency"])
+    raw["fetcher"]["connection_pool_size"] = int(best["pool_size"])
+
+    out = Path(output_path)
+    out.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    print(f"🧩 Recommended config written to: {out}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Crawler Benchmark Matrix")
     parser.add_argument("--config", default="config.yaml")
@@ -227,39 +302,156 @@ def main():
                         help="Comma-separated concurrency values")
     parser.add_argument("--pools", type=str, default=None,
                         help="Comma-separated pool sizes (default: auto = max(20, c*1.1))")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto-increase concurrency until performance plateaus/degrades",
+    )
+    parser.add_argument("--auto-start", type=int, default=30,
+                        help="Auto mode start concurrency")
+    parser.add_argument("--auto-max", type=int, default=1200,
+                        help="Auto mode max concurrency cap")
+    parser.add_argument("--auto-factor", type=float, default=1.6,
+                        help="Auto mode growth factor per step")
+    parser.add_argument("--auto-max-runs", type=int, default=10,
+                        help="Max benchmark runs in auto mode")
+    parser.add_argument("--auto-min-improve", type=float, default=0.05,
+                        help="Minimum relative score improvement to count as meaningful")
+    parser.add_argument("--auto-drop-stop", type=float, default=0.10,
+                        help="Stop if score drops below best by this ratio")
+    parser.add_argument("--auto-max-conn-err", type=float, default=8.0,
+                        help="Stop if connection error rate exceeds this percent")
+    parser.add_argument("--auto-max-timeout", type=float, default=25.0,
+                        help="Stop if timeout rate exceeds this percent")
+    parser.add_argument("--auto-pool-ratio", type=float, default=1.1,
+                        help="Pool size formula in auto mode: c * ratio + bias")
+    parser.add_argument("--auto-pool-bias", type=int, default=10,
+                        help="Pool size formula in auto mode: c * ratio + bias")
+    parser.add_argument(
+        "--write-config",
+        type=str,
+        default=None,
+        help="Write a tuned config YAML to this path",
+    )
     args = parser.parse_args()
 
     setup_logging()
     config = load_config(args.config)
     seeds = load_seeds(args.seeds)
 
-    concurrencies = [int(x) for x in args.concurrency.split(",")]
-
-    # Build test matrix
-    tests = []
-    for c in concurrencies:
-        if args.pools:
-            pools = [int(x) for x in args.pools.split(",")]
-        else:
-            pools = [max(20, int(c * 1.1 + 10))]
-        for p in pools:
-            tests.append((c, p))
-
-    n = len(tests)
-    total_min = n * args.duration / 60
-    print(f"\n🏁 Benchmark: {n} tests × {args.duration}s = {total_min:.0f} min total")
-    print(f"   Seeds: {len(seeds)}, Timeout: {config.fetcher.timeout}s")
-    print(f"   Matrix: {tests}\n")
-
     results = []
-    for i, (c, p) in enumerate(tests):
-        print(f"━━━ [{i+1}/{n}] concurrency={c}, pool={p}, {args.duration}s ━━━")
-        result = asyncio.run(run_single(config, seeds, c, p, args.duration, i))
-        results.append(result)
-        print(f"    → Eff.QPS={result['eff_qps']}, "
-              f"success={result['success']:,} ({result['success_pct']}%), "
-              f"conn_err={result['conn_err_pct']}%, "
-              f"lock_wait={result['lock_wait_ms']:.2f}ms")
+    if args.auto:
+        start = max(1, args.auto_start)
+        current = start
+        tested: set[int] = set()
+        best_score = -1.0
+        plateau_count = 0
+
+        print(
+            f"\n🏁 Auto Benchmark: duration={args.duration}s, start={start}, "
+            f"max={args.auto_max}, factor={args.auto_factor}"
+        )
+        print(f"   Seeds: {len(seeds)}, Timeout: {config.fetcher.timeout}s\n")
+
+        run_idx = 0
+        while run_idx < args.auto_max_runs and current <= args.auto_max:
+            if current in tested:
+                break
+            tested.add(current)
+
+            pool = _auto_pool_size(current, args.auto_pool_ratio, args.auto_pool_bias)
+            print(
+                f"━━━ [{run_idx+1}] auto concurrency={current}, pool={pool}, "
+                f"{args.duration}s ━━━"
+            )
+            result = asyncio.run(
+                run_single(config, seeds, current, pool, args.duration, run_idx)
+            )
+            results.append(result)
+            print(
+                f"    → Eff.QPS={result['eff_qps']}, "
+                f"success={result['success']:,} ({result['success_pct']}%), "
+                f"conn_err={result['conn_err_pct']}%, timeout={result['timeout_pct']}%"
+            )
+
+            run_idx += 1
+
+            if result["crawled"] <= 0:
+                print(
+                    "    ⚠ No crawled URLs observed; stopping auto-search "
+                    "(environment likely blocked)."
+                )
+                break
+
+            score = _row_score(result)
+            if score > best_score:
+                if best_score > 0 and score < best_score * (1 + args.auto_min_improve):
+                    plateau_count += 1
+                else:
+                    plateau_count = 0
+                best_score = score
+            else:
+                plateau_count += 1
+
+            if result["conn_err_pct"] > args.auto_max_conn_err:
+                print(
+                    f"    ⚠ Stop: conn_err={result['conn_err_pct']}% "
+                    f"> {args.auto_max_conn_err}%"
+                )
+                break
+
+            if result["timeout_pct"] > args.auto_max_timeout:
+                print(
+                    f"    ⚠ Stop: timeout={result['timeout_pct']}% "
+                    f"> {args.auto_max_timeout}%"
+                )
+                break
+
+            if best_score > 0 and score < best_score * (1 - args.auto_drop_stop):
+                print(
+                    f"    ⚠ Stop: score dropped > {args.auto_drop_stop*100:.0f}% "
+                    "from best"
+                )
+                break
+
+            if plateau_count >= 2:
+                print("    ⚠ Stop: score plateau detected (2 consecutive weak steps)")
+                break
+
+            next_c = min(
+                args.auto_max,
+                max(current + 1, int(current * args.auto_factor)),
+            )
+            if next_c <= current:
+                break
+            current = next_c
+    else:
+        concurrencies = [int(x) for x in args.concurrency.split(",")]
+
+        # Build test matrix
+        tests = []
+        for c in concurrencies:
+            if args.pools:
+                pools = [int(x) for x in args.pools.split(",")]
+            else:
+                pools = [_auto_pool_size(c, 1.1, 10)]
+            for p in pools:
+                tests.append((c, p))
+
+        n = len(tests)
+        total_min = n * args.duration / 60
+        print(f"\n🏁 Benchmark: {n} tests × {args.duration}s = {total_min:.0f} min total")
+        print(f"   Seeds: {len(seeds)}, Timeout: {config.fetcher.timeout}s")
+        print(f"   Matrix: {tests}\n")
+
+        for i, (c, p) in enumerate(tests):
+            print(f"━━━ [{i+1}/{n}] concurrency={c}, pool={p}, {args.duration}s ━━━")
+            result = asyncio.run(run_single(config, seeds, c, p, args.duration, i))
+            results.append(result)
+            print(f"    → Eff.QPS={result['eff_qps']}, "
+                  f"success={result['success']:,} ({result['success_pct']}%), "
+                  f"conn_err={result['conn_err_pct']}%, "
+                  f"lock_wait={result['lock_wait_ms']:.2f}ms")
 
     print_report(results)
 
@@ -267,6 +459,20 @@ def main():
     report_path = Path("benchmark_results.json")
     report_path.write_text(json.dumps(results, indent=2))
     print(f"📄 Full results: {report_path}")
+
+    best, representative = pick_best_result(results)
+    print(
+        f"🛠 Recommended: concurrency={best['concurrency']}, "
+        f"connection_pool_size={best['pool_size']}"
+    )
+    if not representative:
+        print(
+            "⚠ Benchmark is not representative (no successful fetches / crawls). "
+            "Likely outbound network is blocked in this environment."
+        )
+
+    if args.write_config:
+        write_recommended_config(args.config, args.write_config, best)
 
 
 if __name__ == "__main__":

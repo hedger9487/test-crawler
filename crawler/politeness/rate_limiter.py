@@ -119,7 +119,9 @@ class RateLimiter:
                 self._buckets[domain] = bucket
             elif crawl_delay and (crawl_delay > bucket.min_interval):
                 # Update if robots.txt now specifies a stricter delay
+                # Preserve tokens=0 so the next request must wait the full interval
                 bucket = _DomainBucket(self._max_qps, crawl_delay)
+                bucket.tokens = 0.0  # don't give a free ticket on rebuild
                 self._buckets[domain] = bucket
 
             wait_time = bucket.try_consume()

@@ -51,8 +51,9 @@ def normalize_url(url: str, *, strip_tracking: bool = True) -> str | None:
 
     url = url.strip()
 
-    # Quick reject non-HTTP(S)
-    if not url.startswith(("http://", "https://", "//")):
+    # Quick reject non-HTTP(S) — case-insensitive per RFC 3986
+    url_lower = url.lower()
+    if not url_lower.startswith(("http://", "https://", "//")):
         return None
 
     # Handle protocol-relative URLs

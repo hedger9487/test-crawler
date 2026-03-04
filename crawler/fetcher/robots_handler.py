@@ -17,21 +17,19 @@ import re
 import time
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Regex to extract Crawl-delay from robots.txt (stdlib doesn't parse it)
-_CRAWL_DELAY_RE = re.compile(
-    r"^crawl-delay:\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE | re.MULTILINE
-)
-
 # Regex to extract Sitemap URLs from robots.txt
 _SITEMAP_RE = re.compile(
     r"^sitemap:\s*(https?://\S+)\s*$", re.IGNORECASE | re.MULTILINE
 )
+
+# Max stale lock entries to clean per _get_or_fetch call
+_LOCK_CLEANUP_BATCH = 20
 
 
 class _CachedRobots:
@@ -73,11 +71,13 @@ class RobotsHandler:
         cache_ttl: int = 86_400,
         fetch_timeout: int = 10,
         session: Optional[aiohttp.ClientSession] = None,
+        ssl_verify: bool = False,
     ):
         self._user_agent = user_agent
         self._cache_ttl = cache_ttl
         self._fetch_timeout = fetch_timeout
         self._session = session
+        self._ssl = None if ssl_verify else False  # None = default verify, False = skip
 
         # domain -> _CachedRobots
         self._cache: dict[str, _CachedRobots] = {}
@@ -132,6 +132,9 @@ class RobotsHandler:
                 self._locks[domain] = asyncio.Lock()
             lock = self._locks[domain]
 
+            # Piggyback cleanup: remove locks for domains no longer in cache
+            self._cleanup_stale_locks()
+
         async with lock:
             # Double-check after acquiring lock
             cached = self._cache.get(domain)
@@ -141,6 +144,25 @@ class RobotsHandler:
             entry = await self._fetch_robots(domain, scheme)
             self._cache[domain] = entry
             return entry
+
+    def _cleanup_stale_locks(self) -> None:
+        """Remove lock entries for domains not in cache (or expired).
+
+        Called while holding _global_lock. Cleans at most _LOCK_CLEANUP_BATCH
+        entries per call to avoid blocking.
+        """
+        now = time.monotonic()
+        stale = []
+        for domain in self._locks:
+            if len(stale) >= _LOCK_CLEANUP_BATCH:
+                break
+            cached = self._cache.get(domain)
+            if cached is None or (now - cached.fetched_at) >= self._cache_ttl:
+                stale.append(domain)
+        for domain in stale:
+            lock = self._locks[domain]
+            if not lock.locked():
+                del self._locks[domain]
 
     async def _fetch_robots(self, domain: str, scheme: str) -> _CachedRobots:
         """Fetch and parse robots.txt for a domain."""
@@ -157,7 +179,7 @@ class RobotsHandler:
                 robots_url,
                 timeout=aiohttp.ClientTimeout(total=self._fetch_timeout),
                 allow_redirects=True,
-                ssl=False,
+                ssl=self._ssl,
             ) as resp:
                 if 400 <= resp.status < 500:
                     # 4xx → allow all (robots.txt doesn't exist)
@@ -199,21 +221,55 @@ class RobotsHandler:
     def _extract_crawl_delay(self, robots_text: str, domain: str) -> Optional[float]:
         """Extract Crawl-delay for our user-agent from robots.txt text.
 
-        Strategy: look for Crawl-delay in our user-agent block first,
-        then fall back to the wildcard (*) block's Crawl-delay.
-        Simple approach: just find all Crawl-delay directives and use the
-        first one (most robots.txt files only have one).
+        Properly parses User-agent blocks:
+          1. If our UA has a specific block with Crawl-delay, use that.
+          2. Otherwise fall back to the wildcard (*) block's Crawl-delay.
         """
-        match = _CRAWL_DELAY_RE.search(robots_text)
-        if match:
-            try:
-                delay = float(match.group(1))
-                if delay > 0:
-                    logger.debug("Crawl-delay for %s: %.1fs", domain, delay)
-                    return delay
-            except ValueError:
-                pass
-        return None
+        our_ua = self._user_agent.lower()
+        wildcard_delay: Optional[float] = None
+        specific_delay: Optional[float] = None
+
+        current_agents: list[str] = []
+        in_block = False
+
+        for line in robots_text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Check for User-agent directive (starts new block)
+            if line.lower().startswith("user-agent:"):
+                agent = line.split(":", 1)[1].strip().lower()
+                if not in_block:
+                    current_agents = [agent]
+                    in_block = True
+                else:
+                    current_agents.append(agent)
+                continue
+
+            # Any non-User-agent directive = we're in the block's rules
+            in_block = False
+
+            if line.lower().startswith("crawl-delay:"):
+                try:
+                    delay = float(line.split(":", 1)[1].strip())
+                    if delay <= 0:
+                        continue
+
+                    # Check if this block matches our UA
+                    for agent in current_agents:
+                        if agent == "*":
+                            if wildcard_delay is None:
+                                wildcard_delay = delay
+                        elif agent in our_ua or our_ua in agent:
+                            specific_delay = delay
+                except ValueError:
+                    pass
+
+        result = specific_delay if specific_delay is not None else wildcard_delay
+        if result is not None:
+            logger.debug("Crawl-delay for %s: %.1fs", domain, result)
+        return result
 
     @property
     def cache_size(self) -> int:
@@ -232,7 +288,8 @@ class RobotsHandler:
 
     async def fetch_sitemap(
         self, sitemap_url: str,
-    ) -> list[str]:
+        before_fetch: Optional[Callable[[str], Awaitable[None]]] = None,
+    ) -> Optional[list[str]]:
         """Fetch and parse a sitemap XML, returning ALL page URLs.
 
         Handles both <urlset> (direct URLs) and <sitemapindex>
@@ -241,17 +298,19 @@ class RobotsHandler:
         Memory is managed by the frontier cap, not here.
         """
         if not self._session:
-            return []
+            return None
 
         try:
+            if before_fetch:
+                await before_fetch(sitemap_url)
             async with self._session.get(
                 sitemap_url,
                 timeout=aiohttp.ClientTimeout(total=self._fetch_timeout),
                 allow_redirects=True,
-                ssl=False,
+                ssl=self._ssl,
             ) as resp:
                 if resp.status != 200:
-                    return []
+                    return None
 
                 text = await resp.text(errors="replace")
 
@@ -259,7 +318,7 @@ class RobotsHandler:
                 try:
                     root = ET.fromstring(text)
                 except ET.ParseError:
-                    return []
+                    return None
 
                 # Check if this is a sitemap index (contains nested sitemaps)
                 nested_sitemaps = []
@@ -279,12 +338,15 @@ class RobotsHandler:
                 # If this was a sitemap index, fetch first 3 nested sitemaps
                 if nested_sitemaps and not urls:
                     for nested in nested_sitemaps[:3]:
-                        nested_urls = await self.fetch_sitemap(nested)
-                        urls.extend(nested_urls)
+                        nested_urls = await self.fetch_sitemap(
+                            nested, before_fetch=before_fetch
+                        )
+                        if nested_urls is not None:
+                            urls.extend(nested_urls)
 
                 logger.debug("Sitemap %s: found %d URLs", sitemap_url, len(urls))
                 return urls
 
         except Exception as e:
             logger.debug("Sitemap fetch error for %s: %s", sitemap_url, e)
-            return []
+            return None

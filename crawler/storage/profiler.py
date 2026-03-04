@@ -68,22 +68,33 @@ class CrawlProfiler:
 
         # ── Status code distribution ──
         self._status_counts: Dict[int, int] = collections.defaultdict(int)
+        # domain -> status_code -> count
+        self._status_by_domain: Dict[str, Dict[int, int]] = collections.defaultdict(
+            lambda: collections.defaultdict(int)
+        )
 
         # ── Domain-level stats ──
         # domain -> number of successful crawls
         self._domain_crawl_count: Dict[str, int] = collections.defaultdict(int)
-        # domain -> total new URLs discovered from that domain
+        # domain -> total new URLs discovered from that domain (crawl + sitemap)
         self._domain_yield: Dict[str, int] = collections.defaultdict(int)
+        # domain -> new URLs discovered ONLY from page crawls (not sitemap)
+        self._domain_crawl_yield: Dict[str, int] = collections.defaultdict(int)
         # domain -> number of errors
         self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
+        # domain -> number of robots.txt blocks
+        self._domain_robots_blocked: Dict[str, int] = collections.defaultdict(int)
 
         # ── Latency tracking (in ms) ──
-        self._latencies: list[float] = []
+        self._latencies: collections.deque = collections.deque(maxlen=10_000)
         self._latency_lock = asyncio.Lock()
 
         # ── Rate limiter wait tracking (in seconds) ──
         self._total_rate_wait: float = 0.0
         self._rate_wait_count: int = 0
+
+        # ── Issue→acquire gap tracking (seconds) ──
+        self._issue_acquire_gaps: collections.deque = collections.deque(maxlen=10_000)
 
         # ── Frontier scheduling ──
         self._frontier_cooldown_skips: int = 0
@@ -119,6 +130,7 @@ class CrawlProfiler:
         """Record the result of a fetch attempt."""
         self._urls_crawled += 1
         self._status_counts[status] += 1
+        self._status_by_domain[domain][status] += 1
         self._domain_crawl_count[domain] += 1
 
         if status == 200:
@@ -137,59 +149,99 @@ class CrawlProfiler:
         if latency_ms > 0:
             self._latencies.append(latency_ms)
 
-    def record_discovered(self, domain: str, new_count: int, total_links: int) -> None:
-        """Record URLs discovered from a page."""
+    def record_discovered(
+        self, domain: str, new_count: int, total_links: int,
+        *, from_sitemap: bool = False,
+    ) -> None:
+        """Record URLs discovered from a page or sitemap."""
         self._urls_discovered += new_count
         self._domain_yield[domain] += new_count
+        if not from_sitemap:
+            self._domain_crawl_yield[domain] += new_count
 
     def record_robots_blocked(self, domain: str) -> None:
         self._robots_blocked += 1
+        self._domain_robots_blocked[domain] += 1
 
     def record_rate_wait(self, wait_seconds: float) -> None:
         self._total_rate_wait += wait_seconds
         self._rate_wait_count += 1
+
+    def record_issue_acquire_gap(self, gap_seconds: float) -> None:
+        """Record the time gap between frontier dispatch and rate limiter acquire."""
+        self._issue_acquire_gaps.append(gap_seconds)
 
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
         """Get a yield-based score for a domain. Higher = better for discovery.
 
-        Score = (new URLs discovered from domain) / (crawls of domain + 1)
-        Domains that produce many new URLs per crawl are prioritized.
+        Uses CRAWL yield only (excludes sitemap), so domains that
+        produce new URLs from actual page crawls are prioritized.
+        Applies graduated penalty for robots-blocked domains.
         """
         crawls = self._domain_crawl_count.get(domain, 0)
-        yielded = self._domain_yield.get(domain, 0)
+        crawl_yield = self._domain_crawl_yield.get(domain, 0)
         errors = self._domain_error_count.get(domain, 0)
+        blocked = self._domain_robots_blocked.get(domain, 0)
 
-        if crawls == 0:
+        # Total attempts = crawls + robots blocked
+        total_attempts = crawls + blocked
+
+        if total_attempts == 0:
             return 1.0  # Unknown domains get a neutral score (explore)
+
+        # Robots blocked penalty (graduated)
+        blocked_ratio = blocked / total_attempts
+        if blocked_ratio > 0.9:
+            return -1.0  # Almost entirely blocked → deprioritize hard
+        elif blocked_ratio > 0.5:
+            # Graduated: 50% blocked → 0.5x, 90% blocked → 0.1x
+            penalty = 1.0 - blocked_ratio
+        else:
+            penalty = 1.0
 
         # Error penalty
         error_rate = errors / max(crawls, 1)
         if error_rate > 0.8:
             return -1.0  # Mostly errors → deprioritize
 
-        # Yield per crawl
-        return yielded / (crawls + 1)
+        # Crawl yield per crawl (sitemap yield excluded)
+        base_score = crawl_yield / (crawls + 1)
+        return base_score * penalty
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
-        """Get top N domains by yield."""
+        """Get top N domains by crawl yield per crawl (excludes sitemap yield)."""
         scored = []
-        for domain in set(self._domain_crawl_count) | set(self._domain_yield):
+        for domain in set(self._domain_crawl_count) | set(self._domain_crawl_yield):
             crawls = self._domain_crawl_count.get(domain, 0)
-            yielded = self._domain_yield.get(domain, 0)
+            crawl_yielded = self._domain_crawl_yield.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
             score = self.get_domain_score(domain)
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
-                "yield": yielded,
+                "yield": crawl_yielded,
                 "errors": errors,
-                "yield_per_crawl": yielded / max(crawls, 1),
+                "yield_per_crawl": crawl_yielded / max(crawls, 1),
                 "score": round(score, 2),
             })
-        scored.sort(key=lambda x: x["yield"], reverse=True)
+        scored.sort(key=lambda x: x["yield_per_crawl"], reverse=True)
         return scored[:n]
+
+    def get_most_crawled_domains(self, n: int = 5) -> List[Dict]:
+        """Get top N domains by crawl count."""
+        rows = []
+        for domain, crawls in self._domain_crawl_count.items():
+            success = self._status_by_domain[domain].get(200, 0)
+            rows.append({
+                "domain": domain,
+                "crawls": crawls,
+                "success": success,
+                "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
+            })
+        rows.sort(key=lambda x: x["crawls"], reverse=True)
+        return rows[:n]
 
     # ── Latency percentiles ──
 
@@ -267,7 +319,7 @@ class CrawlProfiler:
         idle_pct = (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0)) / n * 100
 
         # Latency percentiles
-        recent_latencies = self._latencies[-1000:]  # last 1000 for recency
+        recent_latencies = list(self._latencies)[-1000:]  # last 1000 for recency
         p50 = self._percentile(recent_latencies, 50)
         p95 = self._percentile(recent_latencies, 95)
         p99 = self._percentile(recent_latencies, 99)
@@ -281,6 +333,7 @@ class CrawlProfiler:
 
         # Top 5 domains by yield
         top_domains = self.get_top_domains(5)
+        top_crawled = self.get_most_crawled_domains(5)
 
         header = "═══ FINAL CRAWL PROFILE ═══" if final else "─── CRAWL PROFILE ───"
         sep = "═" * 50 if final else "─" * 50
@@ -316,17 +369,47 @@ class CrawlProfiler:
 
   🔄 FRONTIER STATES
     Ready:        {frontier_states.get('ready', 0):>8,}   (available for fetch)
+    Reserved:     {frontier_states.get('reserved', 0):>8,}   (issued to workers)
     Cooling:      {frontier_states.get('cooling', 0):>8,}   (waiting for cooldown)
     Empty:        {frontier_states.get('empty', 0):>8,}   (no pending URLs)
-    Promotions:   {frontier_states.get('promotions', 0):>8,}   (cooling → ready)
+    Promotions:   {frontier_states.get('promotions', 0):>8,}   (cooling → ready)"""
+
+        # Diagnostic section
+        diag_parts = []
+        if self._frontier_ref:
+            issued = getattr(self._frontier_ref, '_issued_domains', [])
+            unique_10k = len(set(issued)) if issued else 0
+            stale_pops = getattr(self._frontier_ref, '_stale_pops', 0)
+            diag_parts.append(f"    Stale pops:   {stale_pops:>8,}   (gen-mismatch skips)")
+            diag_parts.append(f"    Unique/10K:   {unique_10k:>8,}   (unique domains in last 10K issued)")
+        if self._issue_acquire_gaps:
+            gaps = list(self._issue_acquire_gaps)
+            avg_gap = sum(gaps) / len(gaps)
+            p95_gap = self._percentile(gaps, 95)
+            diag_parts.append(f"    Issue→Acq:   {avg_gap:>7.3f}s avg, {p95_gap:.3f}s p95  (frontier→rate_limiter gap)")
+        if diag_parts:
+            report += "\n\n  🔬 DIAGNOSTICS\n" + "\n".join(diag_parts)
+
+        report += f"""
 
   📈 STATUS CODES
     {status_str}
 
-  🏆 TOP DOMAINS (by yield)"""
+  🏆 TOP DOMAINS (by yield per crawl)"""
 
         for d in top_domains:
             report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ypc:{d['yield_per_crawl']:.1f}"
+
+        report += f"""
+
+  🔢 TOP CRAWLED DOMAINS"""
+        for d in top_crawled:
+            report += (
+                f"\n    {d['domain'][:35]:<35} "
+                f"crawls:{d['crawls']:>5}  "
+                f"200:{d['success']:>5}  "
+                f"succ:{d['success_rate']:>5.1f}%"
+            )
 
         report += f"\n{sep}"
         logger.info(report)
@@ -369,6 +452,7 @@ class CrawlProfiler:
                     "total_acquires": self._rate_wait_count,
                 },
                 "top_domains": self.get_top_domains(50),
+                "top_crawled_domains": self.get_most_crawled_domains(50),
                 "time_series": [
                     {"elapsed": t, "crawled": c, "discovered": d, "success": s}
                     for t, c, d, s in self._time_series

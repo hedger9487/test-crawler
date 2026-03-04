@@ -14,6 +14,8 @@ class CrawlURL:
     domain: str
     depth: int = 0
     priority: float = 0.0  # lower = higher priority
+    issue_time: float = 0.0  # set by frontier at dispatch time
+    reservation_id: int = 0  # set by frontier when domain enters Reserved
 
     def __lt__(self, other: "CrawlURL") -> bool:
         return self.priority < other.priority
@@ -35,6 +37,34 @@ class AbstractFrontier(abc.ABC):
     @abc.abstractmethod
     async def get_next(self) -> Optional[CrawlURL]:
         """Get the next URL to crawl. Returns None if empty."""
+        ...
+
+    @abc.abstractmethod
+    async def requeue_issued_url(self, item: CrawlURL) -> bool:
+        """Requeue a URL that was already issued by get_next().
+
+        This bypasses dedup checks because the URL is already known/seen.
+        Returns True if it was put back into the frontier.
+        """
+        ...
+
+    @abc.abstractmethod
+    async def mark_acquired(self, item: CrawlURL) -> bool:
+        """Mark that the worker has successfully acquired a rate-limit slot.
+
+        This transitions the issued domain from Reserved -> Cooling/Empty.
+        Returns True if a matching reservation was finalized.
+        """
+        ...
+
+    @abc.abstractmethod
+    async def release_issued_url(self, item: CrawlURL, *, to_cooling: bool = False) -> bool:
+        """Release a reserved issued URL without page fetch.
+
+        Used when a worker aborts/defers this issued task.
+        If to_cooling=True, the domain returns to Cooling; else Ready/Empty.
+        Returns True if a matching reservation was released.
+        """
         ...
 
     @abc.abstractmethod

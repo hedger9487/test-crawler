@@ -1,0 +1,39 @@
+crawler:
+  concurrency: 64
+  max_time_seconds: 172800
+  user_agent: HW1-Crawler/0.1 (Architecture Design Course; +https://example.edu)
+  seeds_file: seeds.txt
+fetcher:
+  timeout: 10
+  max_redirects: 5
+  connection_pool_size: 80
+  per_host_connections: 1
+  accept_content_types:
+  - text/html
+  - application/xhtml+xml
+politeness:
+  max_qps: 0.5
+  robots_cache_ttl: 86400
+  robots_fetch_timeout: 10
+sitemap:
+  max_xml_per_domain: 3
+  max_queue_per_sitemap: 500
+  max_attempts_per_domain: 3
+  fetch_retries_per_sitemap: 3
+  retry_base_seconds: 0.5
+frontier:
+  bloom_capacity: 100000000
+  bloom_error_rate: 0.001
+  max_depth: -1
+  checkpoint_interval: 300
+  checkpoint_path: checkpoint.pkl
+  max_pending: 5000000
+storage:
+  db_path: crawl_data.db
+  batch_size: 100
+logging:
+  level: INFO
+  stats_interval: 30
+notification:
+  enabled: true
+  discord_webhook: https://discord.com/api/webhooks/1478267061678637147/ZaULPGyjIEzZaH_vJDoJTyJNoqHIteNB4BCAFDdRWQ-pJSDlnuNisKZc1je26Ut2wFNc
