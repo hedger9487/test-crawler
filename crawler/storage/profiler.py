@@ -19,7 +19,7 @@ import collections
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -74,11 +74,9 @@ class CrawlProfiler:
         )
 
         # ── Domain-level stats ──
-        # domain -> number of successful crawls
+        # domain -> number of total crawl attempts (success + failure)
         self._domain_crawl_count: Dict[str, int] = collections.defaultdict(int)
         # domain -> total new URLs discovered from crawled pages
-        self._domain_yield: Dict[str, int] = collections.defaultdict(int)
-        # domain -> new URLs discovered from page crawls
         self._domain_crawl_yield: Dict[str, int] = collections.defaultdict(int)
         # domain -> total fetch time in seconds (accumulated across all attempts)
         self._domain_total_time_s: Dict[str, float] = collections.defaultdict(float)
@@ -89,7 +87,6 @@ class CrawlProfiler:
 
         # ── Latency tracking (in ms) ──
         self._latencies: collections.deque = collections.deque(maxlen=10_000)
-        self._latency_lock = asyncio.Lock()
 
         # ── Rate limiter wait tracking (in seconds) ──
         self._total_rate_wait: float = 0.0
@@ -157,7 +154,6 @@ class CrawlProfiler:
     ) -> None:
         """Record URLs discovered from a crawled page."""
         self._urls_discovered += new_count
-        self._domain_yield[domain] += new_count
         self._domain_crawl_yield[domain] += new_count
 
     def record_robots_blocked(self, domain: str) -> None:
@@ -199,20 +195,18 @@ class CrawlProfiler:
         return crawl_yield / total_time_s
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
-        """Get top N domains by crawl yield per crawl."""
+        """Get top N domains by URLs discovered per second."""
         scored = []
         for domain in set(self._domain_crawl_count) | set(self._domain_crawl_yield):
             crawls = self._domain_crawl_count.get(domain, 0)
             crawl_yielded = self._domain_crawl_yield.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
-            score = self.get_domain_score(domain)
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
                 "yield": crawl_yielded,
                 "errors": errors,
-                "urls_per_sec": round(score, 3),
-                "score": round(score, 3),
+                "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         scored.sort(key=lambda x: x["urls_per_sec"], reverse=True)
         return scored[:n]
@@ -298,7 +292,6 @@ class CrawlProfiler:
         discovery_rate = self._urls_discovered / max(self._urls_success, 1)
 
         # Worker utilization
-        now = time.monotonic()
         worker_states = collections.Counter(
             snap.state for snap in self._worker_states.values()
         )
@@ -385,7 +378,7 @@ class CrawlProfiler:
   📈 STATUS CODES
     {status_str}
 
-  🏆 TOP DOMAINS (by yield per crawl)"""
+  🏆 TOP DOMAINS (by URLs/sec)"""
 
         for d in top_domains:
             report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
