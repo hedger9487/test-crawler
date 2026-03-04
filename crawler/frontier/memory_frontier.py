@@ -464,9 +464,13 @@ class MemoryFrontier(AbstractFrontier):
             return None  # frontier truly empty
 
     async def requeue_issued_url(self, item: CrawlURL) -> bool:
-        """Put an already-issued URL back into the domain queue.
+        """Put an already-issued URL back into the domain queue and release
+        the domain reservation so it becomes dispatchable again.
 
-        Used when worker decides to defer the page fetch (e.g., after a transient error).
+        This is a single atomic operation: it restores the URL to the front
+        of the domain queue AND transitions Reserved → Ready.  Callers do
+        NOT need a separate release_issued_url() call afterwards.
+
         This must NOT hit bloom dedup; the URL is already known.
         """
         if item is None or not item.url:
@@ -486,9 +490,18 @@ class MemoryFrontier(AbstractFrontier):
             self._pending_count += 1
 
             state = self._domain_state.get(domain)
-            if state is None or state == "empty":
+            if state == "reserved":
+                # Verify this item still holds the reservation
+                rid = self._reserved.get(domain)
+                if rid is not None and rid != item.reservation_id:
+                    # Stale reservation — another worker owns this domain.
+                    # URL was re-enqueued; domain state unchanged.
+                    return True
+                self._finalize_reserved_locked(domain, to_cooling=False)
+            elif state is None or state == "empty":
                 self._empty.discard(domain)
                 self._push_ready(domain)
+            # Cooling or Ready: URL is queued; domain state stays as-is.
             return True
 
     async def mark_acquired(self, item: CrawlURL) -> bool:

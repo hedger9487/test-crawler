@@ -1,12 +1,12 @@
 crawler:
-  concurrency: 64
+  concurrency: 409
   max_time_seconds: 172800
   user_agent: HW1-Crawler/0.1 (Architecture Design Course; +https://example.edu)
   seeds_file: seeds.txt
 fetcher:
   timeout: 10
   max_redirects: 5
-  connection_pool_size: 80
+  connection_pool_size: 459
   per_host_connections: 1
   accept_content_types:
   - text/html
