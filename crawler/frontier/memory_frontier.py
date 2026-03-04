@@ -88,14 +88,14 @@ class BloomFilter:
 _DEFAULT_COOLDOWN = 2.0
 
 # Domain scheduling tiers:
-#   Explore (issue_count < _EXPLORE_ISSUE_LIMIT): guarantee first few crawls
-#   Mature  (issue_count >= _EXPLORE_ISSUE_LIMIT): scored by YPC × success_rate
+#   Explore (issue_count < _EXPLORE_ISSUE_LIMIT): flat high priority — guarantee
+#     first few crawls before competing on score.
+#   Mature  (issue_count >= _EXPLORE_ISSUE_LIMIT): scored by discovered/attempts
+#     (avg new URLs per request regardless of success/failure).  Capped at
+#     _MAX_SCORE_PRIORITY so any Explore domain always outranks any Mature domain.
 _EXPLORE_PRIORITY = 3_000_000.0
 _EXPLORE_ISSUE_LIMIT = 3
 _MAX_SCORE_PRIORITY = 1_000_000.0
-# Every Nth dispatch: reserve one slot for a Mature domain so explore-tier
-# domains cannot permanently starve mature high-score domains.
-_NON_EXPLORE_SLOT_EVERY = 5
 
 
 class MemoryFrontier(AbstractFrontier):
@@ -205,14 +205,15 @@ class MemoryFrontier(AbstractFrontier):
         """Compute scheduling priority.
 
         Explore tier (issue_count < _EXPLORE_ISSUE_LIMIT):
-          Flat high priority — every new domain gets its first few crawls
-          before competing on score.
+          Flat _EXPLORE_PRIORITY for the first few crawls — every domain gets
+          a chance before score-based competition begins.
 
         Mature tier (issue_count >= _EXPLORE_ISSUE_LIMIT):
-          score = YPC × success_rate
-                = (discovered / crawls) × (successes / crawls)
-          = avg new URLs returned per request issued (regardless of outcome).
-          Capped at _MAX_SCORE_PRIORITY to prevent outlier monopoly.
+          score = discovered_urls / total_attempts
+          = avg new URLs per request issued (failed requests penalise score
+            naturally by increasing the denominator).
+          Capped at _MAX_SCORE_PRIORITY (< _EXPLORE_PRIORITY) so no Mature
+          domain can ever outrank an Explore-tier domain.
         """
         issue_count = self._domain_issue_count.get(domain, 0)
         if issue_count < _EXPLORE_ISSUE_LIMIT:
@@ -415,35 +416,22 @@ class MemoryFrontier(AbstractFrontier):
 
             # Step 2: find a ready domain with URLs
             # (stale entries in heap are possible if yield scores changed)
-            force_non_new = ((self._ready_dispatch_count + 1) % _NON_EXPLORE_SLOT_EVERY == 0)
-            for pass_idx in range(2):
-                enforce_non_new = force_non_new and pass_idx == 0
-                skipped_new: list[tuple[float, int, int, str]] = []
+            # Pure priority order: Explore-tier domains (issue_count < _EXPLORE_ISSUE_LIMIT)
+            # always outrank Mature domains because _EXPLORE_PRIORITY > _MAX_SCORE_PRIORITY.
+            while self._ready:
+                neg_score, gen, tie, domain = heapq.heappop(self._ready)
 
-                while self._ready:
-                    neg_score, gen, tie, domain = heapq.heappop(self._ready)
+                # Skip stale entries: gen must match current domain gen
+                if gen != self._domain_ready_gen.get(domain, 0):
+                    self._stale_pops += 1
+                    continue
 
-                    # Skip stale entries: gen must match current domain gen
-                    if gen != self._domain_ready_gen.get(domain, 0):
-                        self._stale_pops += 1
-                        continue
+                item = self._issue_from_ready_domain_locked(domain)
+                if item is None:
+                    continue
 
-                    if enforce_non_new and self._domain_issue_count.get(domain, 0) < _EXPLORE_ISSUE_LIMIT:
-                        skipped_new.append((neg_score, gen, tie, domain))
-                        continue
-
-                    item = self._issue_from_ready_domain_locked(domain)
-                    if item is None:
-                        continue
-
-                    for entry in skipped_new:
-                        heapq.heappush(self._ready, entry)
-
-                    self._lock_hold_total += time.monotonic() - t_acquired
-                    return item
-
-                for entry in skipped_new:
-                    heapq.heappush(self._ready, entry)
+                self._lock_hold_total += time.monotonic() - t_acquired
+                return item
 
             # No ready domains — check if any cooling domains exist
             # If so, pop the soonest one (minimize worker idle time)

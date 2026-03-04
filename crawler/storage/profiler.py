@@ -172,24 +172,22 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """Compute YPC × success_rate for a domain.
+        """Compute discovered URLs per crawl attempt for a domain.
 
-        = (discovered / crawls) × (successes / crawls)
-        = avg new URLs returned per request issued (regardless of outcome).
+        = total_discovered / total_attempts
+        = avg new URLs returned per request, regardless of success/failure.
 
-        Returns 1.0 for unexplored domains (neutral / explore-first).
-        Returns 0.0 if the domain has never returned a 200.
+        Failed attempts increase the denominator without contributing to the
+        numerator, so error-heavy domains are naturally penalised.
+
+        Returns 1.0 for unexplored domains (neutral / will enter Explore tier).
         """
         crawls = self._domain_crawl_count.get(domain, 0)
         if crawls == 0:
             return 1.0  # unexplored — neutral score, will enter Explore tier anyway
 
         crawl_yield = self._domain_crawl_yield.get(domain, 0)
-        success = self._status_by_domain[domain].get(200, 0)
-
-        ypc = crawl_yield / crawls
-        success_rate = success / crawls
-        return ypc * success_rate
+        return crawl_yield / crawls
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
         """Get top N domains by crawl yield per crawl."""

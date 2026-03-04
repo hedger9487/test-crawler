@@ -9,7 +9,6 @@ from crawler.frontier.memory_frontier import (
     _EXPLORE_PRIORITY,
     _EXPLORE_ISSUE_LIMIT,
     _MAX_SCORE_PRIORITY,
-    _NON_EXPLORE_SLOT_EVERY,
 )
 
 
@@ -199,34 +198,6 @@ async def test_requeue_issued_url_restores_pending_work():
     again = await frontier.get_next()
     assert again is not None
     assert again.url == item.url
-
-
-@pytest.mark.asyncio
-async def test_slot_enforcement_ensures_mature_domain_dispatched():
-    """Every _NON_EXPLORE_SLOT_EVERY-th dispatch reserves a slot for a Mature
-    domain so Explore-tier domains cannot permanently starve Mature ones."""
-    frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-
-    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
-    frontier.update_domain_priorities({"mature.com": 50.0})
-
-    await frontier.add_url("https://mature.com/1")
-    for i in range(_NON_EXPLORE_SLOT_EVERY * 2):
-        await frontier.add_url(f"https://new{i}.com/1")
-
-    dispatched = []
-    for _ in range(_NON_EXPLORE_SLOT_EVERY * 2 + 1):
-        item = await frontier.get_next()
-        if item is None:
-            break
-        dispatched.append(item.domain)
-        await frontier.release_issued_url(item)
-
-    first_batch = set(dispatched[:_NON_EXPLORE_SLOT_EVERY])
-    assert "mature.com" in first_batch, (
-        f"mature.com must appear in first {_NON_EXPLORE_SLOT_EVERY} dispatches; "
-        f"got: {dispatched}"
-    )
 
 
 @pytest.mark.asyncio
@@ -508,66 +479,6 @@ async def test_empty_domain_reactivates_only_when_self_link_added():
     assert "pw.live" not in frontier._empty
     stats = frontier.state_stats
     assert stats.get("ready", 0) >= 1 or stats.get("cooling", 0) >= 1
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Non-new slot enforcement
-# ──────────────────────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_non_explore_slot_skips_all_explore_tier_domains():
-    """
-    The 1-in-N enforcement skips ALL Explore-tier domains
-    (issue_count < _EXPLORE_ISSUE_LIMIT), including partially-explored ones
-    (issue_count 1, 2), not just brand-new ones (issue_count 0).
-    A Mature domain must appear within the first _NON_EXPLORE_SLOT_EVERY dispatches.
-    """
-    frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-
-    # Mature domain: should be forced through on the enforcement slot
-    frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
-    frontier.update_domain_priorities({"mature.com": 0.1})
-
-    # Explore-tier mix: issue_count = 0, 1, 2 (all < _EXPLORE_ISSUE_LIMIT)
-    for i, cnt in enumerate([0, 1, 2, 0, 1]):
-        d = f"explore{i}.com"
-        frontier._domain_issue_count[d] = cnt
-        await frontier.add_url(f"https://{d}/1")
-    await frontier.add_url("https://mature.com/1")
-
-    dispatched = []
-    for _ in range(_NON_EXPLORE_SLOT_EVERY + 1):
-        item = await frontier.get_next()
-        if item is None:
-            break
-        dispatched.append(item.domain)
-        await frontier.release_issued_url(item)
-
-    first_batch = set(dispatched[:_NON_EXPLORE_SLOT_EVERY])
-    assert "mature.com" in first_batch, (
-        f"mature.com must appear in first {_NON_EXPLORE_SLOT_EVERY} dispatches; "
-        f"got: {dispatched}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_slot_enforcement_falls_back_when_no_mature_domains_exist():
-    """
-    If ALL ready domains are Explore-tier, the 1-in-N slot enforcement
-    must fall back and still dispatch one — not return None.
-    """
-    frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-
-    for i in range(10):
-        await frontier.add_url(f"https://new{i}.com/1")
-    # All are New (issue_count==0)
-
-    # Even on the forced-non-new dispatch slot, something must be returned
-    # (no non-new domains available, so it falls back to new)
-    for _ in range(10):
-        item = await frontier.get_next()
-        assert item is not None, "Must not return None when New domains are available"
-        await frontier.release_issued_url(item)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
