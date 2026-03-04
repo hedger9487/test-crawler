@@ -276,6 +276,14 @@ class CrawlOrchestrator:
                     redirect_url=result.redirect_url,
                 )
 
+                # 429 → server is actively rate-limiting our IP; apply a
+                # 60 s backoff so the domain doesn't hammer the host again
+                # immediately after the normal 2 s politeness cooldown.
+                if result.status == 429:
+                    await self._politeness.backoff_domain(
+                        crawl_url.domain, extra_seconds=60.0
+                    )
+
                 # ── Phase: Parse & enqueue ──
                 if result.is_success and result.is_html and result.html:
                     self._profiler.worker_set_state(
@@ -304,13 +312,6 @@ class CrawlOrchestrator:
                         self._profiler.record_discovered(
                             source_domain, internal_new, external_new,
                         )
-
-                        # Record in-degree for each distinct external destination.
-                        ext_dest_domains = {
-                            get_domain(l) for l in external_links if get_domain(l)
-                        }
-                        if ext_dest_domains:
-                            self._profiler.record_outlinks(source_domain, ext_dest_domains)
 
                     except Exception as e:
                         logger.debug("Parse/enqueue error for %s: %s", crawl_url.url, e)

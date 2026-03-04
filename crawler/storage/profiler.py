@@ -18,20 +18,12 @@ import asyncio
 import collections
 import json
 import logging
-import math
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
-
-# Maximum number of distinct referrer domains tracked per target domain.
-# log10(10 + 10_000) ≈ 4.0  vs  log10(10 + 1_000_000) ≈ 6.0 — the
-# marginal authority gain past this point is minimal, and each entry beyond
-# it costs only 8 bytes (interned pointer), so 10 000 is a safe ceiling.
-_MAX_REFERRERS_PER_DOMAIN = 10_000
 
 
 @dataclass
@@ -94,8 +86,6 @@ class CrawlProfiler:
         self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
         # domain -> number of robots.txt blocks
         self._domain_robots_blocked: Dict[str, int] = collections.defaultdict(int)
-        # domain -> set of distinct domains that have linked to it (in-degree referrers)
-        self._domain_in_degree_referrers: Dict[str, Set[str]] = collections.defaultdict(set)
 
         # ── Latency tracking (in ms) ──
         self._latencies: collections.deque = collections.deque(maxlen=10_000)
@@ -175,26 +165,6 @@ class CrawlProfiler:
         self._domain_yield_internal[domain] += internal_new
         self._domain_yield_external[domain] += external_new
 
-    def record_outlinks(
-        self, source_domain: str, dest_domains: Set[str],
-    ) -> None:
-        """Record that source_domain linked to each domain in dest_domains.
-
-        Updates in-degree referrers for each destination, enabling
-        authority scoring via log10(10 + in_degree).
-
-        Domain strings are interned so every copy of e.g. "example.com"
-        shares one Python object, keeping set entries at 8 bytes each.
-        Referrers per domain are capped at _MAX_REFERRERS_PER_DOMAIN;
-        log10 compression makes anything beyond ~10 000 rounding error.
-        """
-        src = sys.intern(source_domain)
-        for dest in dest_domains:
-            if dest and dest != source_domain:
-                bucket = self._domain_in_degree_referrers[sys.intern(dest)]
-                if len(bucket) < _MAX_REFERRERS_PER_DOMAIN:
-                    bucket.add(src)
-
     def record_robots_blocked(self, domain: str) -> None:
         self._robots_blocked += 1
         self._domain_robots_blocked[domain] += 1
@@ -212,7 +182,7 @@ class CrawlProfiler:
     def get_domain_score(self, domain: str) -> float:
         """Compute scheduling priority score for a domain.
 
-        score = Y_weighted / T  ×  log10(10 + I)
+        score = Y_weighted / T
 
           Y_weighted = Y_ext × 10 + Y_int
             External links are weighted 10× higher than internal links:
@@ -224,10 +194,6 @@ class CrawlProfiler:
             Failed attempts / timeouts burn T without contributing to Y,
             so error-heavy domains are penalised automatically.
 
-          I = in-degree (number of distinct domains that link to this one)
-            log10(10 + I) gives diminishing-return authority boost:
-              I=0  → 1.0×,  I=90  → 2.0×,  I=990  → 3.0×
-
         Returns 1.0 for unexplored domains (neutral / Explore tier entry).
         """
         total_time_s = self._domain_total_time_s.get(domain, 0.0)
@@ -238,10 +204,7 @@ class CrawlProfiler:
         y_ext = self._domain_yield_external.get(domain, 0)
         weighted_yield = y_ext * 10 + y_int
 
-        referrers = self._domain_in_degree_referrers.get(domain, set())
-        authority = math.log10(10 + len(referrers))
-
-        return (weighted_yield / total_time_s) * authority
+        return weighted_yield / total_time_s
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
         """Get top N domains by score (weighted URLs/sec × authority)."""
@@ -256,14 +219,12 @@ class CrawlProfiler:
             y_int = self._domain_yield_internal.get(domain, 0)
             y_ext = self._domain_yield_external.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
-            in_degree = len(self._domain_in_degree_referrers.get(domain, set()))
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
                 "yield_int": y_int,
                 "yield_ext": y_ext,
                 "errors": errors,
-                "in_degree": in_degree,
                 "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         scored.sort(key=lambda x: x["urls_per_sec"], reverse=True)
@@ -274,13 +235,11 @@ class CrawlProfiler:
         rows = []
         for domain, crawls in self._domain_crawl_count.items():
             success = self._status_by_domain[domain].get(200, 0)
-            in_degree = len(self._domain_in_degree_referrers.get(domain, set()))
             rows.append({
                 "domain": domain,
                 "crawls": crawls,
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
-                "in_degree": in_degree,
                 "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
@@ -443,7 +402,6 @@ class CrawlProfiler:
             report += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
-                f"in⇐:{d['in_degree']:>4}  "
                 f"crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
             )
 
@@ -455,7 +413,6 @@ class CrawlProfiler:
                 f"\n    {d['domain'][:33]:<33} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
-                f"in⇐:{d['in_degree']:>4}  "
                 f"ups:{d['urls_per_sec']:>6.2f}"
             )
 

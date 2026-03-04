@@ -29,16 +29,16 @@ def test_score_is_zero_when_domain_has_attempts_but_no_yield():
 
 
 def test_score_equals_yield_divided_by_total_time():
-    """score = Y_weighted / T × authority  (with no in-degree authority=1.0)."""
+    """score = Y_weighted / T  where Y_weighted = Y_ext*10 + Y_int."""
     p = _make_profiler()
     # 3 attempts × 1 000 ms each → total_time_s = 3.0
     for _ in range(3):
         p.record_fetch("a.com", status=200, latency_ms=1_000.0, is_html=True)
-    # 6 internal URLs discovered, no external, no in-degree → authority = log10(10) = 1.0
+    # 6 internal URLs discovered, no external
     p.record_discovered("a.com", internal_new=6, external_new=0)
 
-    # Y_weighted = 6*1 + 0*10 = 6 ; authority = 1.0
-    expected = 6 / 3.0 * 1.0  # = 2.0
+    # Y_weighted = 6*1 + 0*10 = 6
+    expected = 6 / 3.0  # = 2.0
     assert p.get_domain_score("a.com") == pytest.approx(expected)
 
 
@@ -46,9 +46,8 @@ def test_external_links_weighted_10x_over_internal():
     """
     Two domains with identical latency and total link count:
     the one that discovered external links scores 10× higher than
-    the pure-internal domain (same time, same total yield, no in-degree).
+    the pure-internal domain (same time, same total yield).
     """
-    import math
     p = _make_profiler()
 
     # hub.com: 1 s fetch, 5 external URLs discovered
@@ -60,41 +59,11 @@ def test_external_links_weighted_10x_over_internal():
     p.record_discovered("silo.com", internal_new=5, external_new=0)
 
     # hub.com: Y_weighted = 5*10 = 50, silo.com: Y_weighted = 5*1 = 5
-    assert p.get_domain_score("hub.com") == pytest.approx(
-        (50 / 1.0) * math.log10(10)
-    )
-    assert p.get_domain_score("silo.com") == pytest.approx(
-        (5 / 1.0) * math.log10(10)
-    )
+    assert p.get_domain_score("hub.com") == pytest.approx(50 / 1.0)
+    assert p.get_domain_score("silo.com") == pytest.approx(5 / 1.0)
     assert p.get_domain_score("hub.com") == pytest.approx(
         p.get_domain_score("silo.com") * 10
     )
-
-
-def test_in_degree_authority_boosts_score():
-    """
-    Two domains with identical yield and latency:
-    the one with more in-degree referrers scores higher.
-    """
-    import math
-    p = _make_profiler()
-
-    for domain in ("popular.com", "unknown.com"):
-        p.record_fetch(domain, status=200, latency_ms=1_000.0, is_html=True)
-        p.record_discovered(domain, internal_new=5, external_new=0)
-
-    # popular.com has 90 referrers → authority = log10(100) = 2.0
-    p.record_outlinks("ref1.com", {"popular.com"})
-    for i in range(2, 91):  # +89 more distinct referrers
-        p.record_outlinks(f"ref{i}.com", {"popular.com"})
-
-    score_popular = p.get_domain_score("popular.com")
-    score_unknown = p.get_domain_score("unknown.com")
-
-    assert score_popular > score_unknown, (
-        "popular.com (in-degree=90, authority=2.0) must outrank unknown.com (in-degree=0, authority=1.0)"
-    )
-    assert score_popular == pytest.approx(score_unknown * 2.0, rel=1e-3)
 
 
 def test_faster_domain_scores_higher_than_slower_equal_yield_domain():
@@ -230,7 +199,7 @@ def test_get_top_domains_row_contains_expected_keys():
     p.record_discovered("x.com", internal_new=2, external_new=0)
 
     row = p.get_top_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "in_degree", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "urls_per_sec"}
 
 
 def test_get_top_domains_n_limits_results():
@@ -261,7 +230,7 @@ def test_get_most_crawled_domains_row_contains_expected_keys():
     p.record_fetch("k.com", status=200, latency_ms=300.0, is_html=True)
 
     row = p.get_most_crawled_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "in_degree", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "urls_per_sec"}
 
 
 def test_get_most_crawled_domains_success_rate_calculation():

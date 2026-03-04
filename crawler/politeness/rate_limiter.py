@@ -156,6 +156,20 @@ class RateLimiter:
         deficit = 1.0 - simulated_tokens
         return deficit / bucket.refill_rate
 
+    async def backoff_domain(self, domain: str, extra_seconds: float = 60.0) -> None:
+        """Drain the token bucket for *domain* to force a longer cooldown.
+
+        Call this after a 429 response so the domain waits approximately
+        *extra_seconds* before the next fetch attempt, on top of the normal
+        politeness interval.
+        """
+        async with self._global_lock:
+            bucket = self._buckets.get(domain)
+            if bucket:
+                bucket.refill()
+                # Drain enough tokens to enforce extra_seconds additional wait.
+                bucket.tokens -= extra_seconds * bucket.refill_rate
+
     @property
     def default_interval(self) -> float:
         """The base interval between requests (1/max_qps)."""
