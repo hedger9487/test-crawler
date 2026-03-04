@@ -209,9 +209,9 @@ class MemoryFrontier(AbstractFrontier):
           a chance before score-based competition begins.
 
         Mature tier (issue_count >= _EXPLORE_ISSUE_LIMIT):
-          score = discovered_urls / total_attempts
-          = avg new URLs per request issued (failed requests penalise score
-            naturally by increasing the denominator).
+          score = discovered_urls / total_time_s  (URLs per second)
+          = Y/T, which equals ypc / avg_latency — naturally penalises both
+            low-yield pages and slow/timing-out domains without extra terms.
           Capped at _MAX_SCORE_PRIORITY (< _EXPLORE_PRIORITY) so no Mature
           domain can ever outrank an Explore-tier domain.
         """

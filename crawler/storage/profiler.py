@@ -80,6 +80,8 @@ class CrawlProfiler:
         self._domain_yield: Dict[str, int] = collections.defaultdict(int)
         # domain -> new URLs discovered from page crawls
         self._domain_crawl_yield: Dict[str, int] = collections.defaultdict(int)
+        # domain -> total fetch time in seconds (accumulated across all attempts)
+        self._domain_total_time_s: Dict[str, float] = collections.defaultdict(float)
         # domain -> number of errors
         self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
         # domain -> number of robots.txt blocks
@@ -132,6 +134,7 @@ class CrawlProfiler:
         self._status_counts[status] += 1
         self._status_by_domain[domain][status] += 1
         self._domain_crawl_count[domain] += 1
+        self._domain_total_time_s[domain] += latency_ms / 1000.0
 
         if status == 200:
             self._urls_success += 1
@@ -172,22 +175,28 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """Compute discovered URLs per crawl attempt for a domain.
+        """URLs discovered per second of total fetch time.
 
-        = total_discovered / total_attempts
-        = avg new URLs returned per request, regardless of success/failure.
+        score = Y / T  =  total_discovered / total_time_spent_seconds
 
-        Failed attempts increase the denominator without contributing to the
-        numerator, so error-heavy domains are naturally penalised.
+        Mathematically equivalent to:
+            (discovered / attempts) / (time / attempts)
+          = ypc / avg_latency
+
+        This naturally captures both dimensions:
+          - Yield rate: domains that discover more URLs per page rank higher.
+          - Speed:      faster domains rank higher than equally-yielding slow ones.
+          - Failures:   timeouts burn time (large T) without producing URLs (Y=0),
+                        so error-heavy domains are penalised without any extra term.
 
         Returns 1.0 for unexplored domains (neutral / will enter Explore tier).
         """
-        crawls = self._domain_crawl_count.get(domain, 0)
-        if crawls == 0:
+        total_time_s = self._domain_total_time_s.get(domain, 0.0)
+        if total_time_s == 0.0:
             return 1.0  # unexplored — neutral score, will enter Explore tier anyway
 
         crawl_yield = self._domain_crawl_yield.get(domain, 0)
-        return crawl_yield / crawls
+        return crawl_yield / total_time_s
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
         """Get top N domains by crawl yield per crawl."""
@@ -202,10 +211,10 @@ class CrawlProfiler:
                 "crawls": crawls,
                 "yield": crawl_yielded,
                 "errors": errors,
-                "yield_per_crawl": crawl_yielded / max(crawls, 1),
-                "score": round(score, 2),
+                "urls_per_sec": round(score, 3),
+                "score": round(score, 3),
             })
-        scored.sort(key=lambda x: x["yield_per_crawl"], reverse=True)
+        scored.sort(key=lambda x: x["urls_per_sec"], reverse=True)
         return scored[:n]
 
     def get_most_crawled_domains(self, n: int = 5) -> List[Dict]:
@@ -219,7 +228,7 @@ class CrawlProfiler:
                 "crawls": crawls,
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
-                "ypc": crawl_yielded / crawls if crawls > 0 else 0.0,
+                "urls_per_sec": round(self.get_domain_score(domain), 3),
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
         return rows[:n]
@@ -379,7 +388,7 @@ class CrawlProfiler:
   🏆 TOP DOMAINS (by yield per crawl)"""
 
         for d in top_domains:
-            report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ypc:{d['yield_per_crawl']:.1f}"
+            report += f"\n    {d['domain'][:35]:<35} yield:{d['yield']:>6}  crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
 
         report += f"""
 
@@ -389,7 +398,7 @@ class CrawlProfiler:
                 f"\n    {d['domain'][:35]:<35} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
-                f"ypc:{d['ypc']:>6.1f}"
+                f"ups:{d['urls_per_sec']:>6.2f}"
             )
 
         report += f"\n{sep}"
