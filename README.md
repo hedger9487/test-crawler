@@ -22,7 +22,7 @@ python -m crawler.main --seeds seeds.txt --concurrency 300 --max-time 3600
 
 ```
 Orchestrator → N async workers
-  ├─ Frontier (per-domain queues + Bloom filter dedup)
+  ├─ Frontier (four-state scheduler + per-domain queues + Bloom filter dedup)
   ├─ Fetcher (aiohttp connection pool + DNS cache)
   ├─ Politeness (robots.txt cache + per-domain rate limiter)
   ├─ Parser (selectolax link extraction + URL normalization)
@@ -31,9 +31,11 @@ Orchestrator → N async workers
 
 ## Key Design Decisions
 
-- **Per-domain round-robin**: Fair scheduling across domains
-- **0.5 QPS rate limit**: Token bucket per domain
-- **Bloom filter**: O(1) dedup for 50M+ URLs
+- **Four-state domain scheduler**: Ready / Reserved / Cooling / Empty with O(log N) `get_next()`
+- **Tiered priority**: New domains (3M) → Warmup ≤3 fetches (2M) → Mature YPC-scored (1M cap). Every 5th pick reserves a non-new domain slot to prevent starvation.
+- **Organic BFS only**: No sitemap pre-seeding — bulk injection breaks the tier invariants and wastes frontier cap. All discovery is driven by link extraction from crawled pages.
+- **0.5 QPS rate limit**: Token bucket per domain; `Crawl-delay` from robots.txt overrides if stricter
+- **Bloom filter**: O(1) dedup, 100M capacity ≈ 160 MB
 - **Checkpoint/Resume**: Frontier state saved every 5 min
 - **Abstract interfaces**: Swap SQLite → Redis without touching orchestrator
 

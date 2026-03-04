@@ -76,9 +76,9 @@ class CrawlProfiler:
         # ── Domain-level stats ──
         # domain -> number of successful crawls
         self._domain_crawl_count: Dict[str, int] = collections.defaultdict(int)
-        # domain -> total new URLs discovered from that domain (crawl + sitemap)
+        # domain -> total new URLs discovered from crawled pages
         self._domain_yield: Dict[str, int] = collections.defaultdict(int)
-        # domain -> new URLs discovered ONLY from page crawls (not sitemap)
+        # domain -> new URLs discovered from page crawls
         self._domain_crawl_yield: Dict[str, int] = collections.defaultdict(int)
         # domain -> number of errors
         self._domain_error_count: Dict[str, int] = collections.defaultdict(int)
@@ -151,13 +151,11 @@ class CrawlProfiler:
 
     def record_discovered(
         self, domain: str, new_count: int, total_links: int,
-        *, from_sitemap: bool = False,
     ) -> None:
-        """Record URLs discovered from a page or sitemap."""
+        """Record URLs discovered from a crawled page."""
         self._urls_discovered += new_count
         self._domain_yield[domain] += new_count
-        if not from_sitemap:
-            self._domain_crawl_yield[domain] += new_count
+        self._domain_crawl_yield[domain] += new_count
 
     def record_robots_blocked(self, domain: str) -> None:
         self._robots_blocked += 1
@@ -176,9 +174,8 @@ class CrawlProfiler:
     def get_domain_score(self, domain: str) -> float:
         """Get a yield-based score for a domain. Higher = better for discovery.
 
-        Uses CRAWL yield only (excludes sitemap), so domains that
-        produce new URLs from actual page crawls are prioritized.
-        Applies graduated penalty for robots-blocked domains.
+        Uses crawl yield (URLs discovered per page), with graduated penalties
+        for robots-blocked and high-error domains.
         """
         crawls = self._domain_crawl_count.get(domain, 0)
         crawl_yield = self._domain_crawl_yield.get(domain, 0)
@@ -206,12 +203,12 @@ class CrawlProfiler:
         if error_rate > 0.8:
             return -1.0  # Mostly errors → deprioritize
 
-        # Crawl yield per crawl (sitemap yield excluded)
+        # Crawl yield per crawl
         base_score = crawl_yield / (crawls + 1)
         return base_score * penalty
 
     def get_top_domains(self, n: int = 20) -> List[Dict]:
-        """Get top N domains by crawl yield per crawl (excludes sitemap yield)."""
+        """Get top N domains by crawl yield per crawl."""
         scored = []
         for domain in set(self._domain_crawl_count) | set(self._domain_crawl_yield):
             crawls = self._domain_crawl_count.get(domain, 0)

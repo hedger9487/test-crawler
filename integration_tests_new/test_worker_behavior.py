@@ -115,7 +115,7 @@ class _FakeProfiler:
     def record_fetch(self, domain, status, latency_ms, is_html, error=""):
         self.fetch_records.append((domain, status, latency_ms, is_html, error))
 
-    def record_discovered(self, domain, new_count, total_links, from_sitemap=False):
+    def record_discovered(self, domain, new_count, total_links):
         self.discovered.append((domain, new_count, total_links))
 
 
