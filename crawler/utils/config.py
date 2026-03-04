@@ -65,15 +65,6 @@ class NotificationConfig:
 
 
 @dataclass(frozen=True)
-class SitemapConfig:
-    max_xml_per_domain: int = 3
-    max_queue_per_sitemap: int = 500
-    max_attempts_per_domain: int = 3
-    fetch_retries_per_sitemap: int = 3
-    retry_base_seconds: float = 0.5
-
-
-@dataclass(frozen=True)
 class Config:
     crawler: CrawlerConfig = field(default_factory=CrawlerConfig)
     fetcher: FetcherConfig = field(default_factory=FetcherConfig)
@@ -82,7 +73,6 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     notification: NotificationConfig = field(default_factory=NotificationConfig)
-    sitemap: SitemapConfig = field(default_factory=SitemapConfig)
 
 
 def _make_dc(cls, data: dict | None):
@@ -109,5 +99,4 @@ def load_config(path: str | Path) -> Config:
         storage=_make_dc(StorageConfig, raw.get("storage")),
         logging=_make_dc(LoggingConfig, raw.get("logging")),
         notification=_make_dc(NotificationConfig, raw.get("notification")),
-        sitemap=_make_dc(SitemapConfig, raw.get("sitemap")),
     )

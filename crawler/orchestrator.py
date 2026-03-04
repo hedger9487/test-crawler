@@ -10,7 +10,6 @@ domain yield data to dynamically prioritize productive domains.
 from __future__ import annotations
 
 import asyncio
-import collections
 import logging
 import signal
 import time
@@ -53,22 +52,6 @@ class CrawlOrchestrator:
         self._storage: Optional[SQLiteStorage] = None
         self._profiler: Optional[CrawlProfiler] = None
 
-        # Sitemap tracking: domains we've already fetched sitemaps for
-        self._sitemap_done: set[str] = set()
-        self._sitemap_inflight: set[str] = set()
-        self._sitemap_failures: dict[str, int] = collections.defaultdict(int)
-        self._sitemap_next_retry_at: dict[str, float] = {}
-        self._sitemap_lock = asyncio.Lock()
-        self._sitemap_max_attempts = max(1, int(config.sitemap.max_attempts_per_domain))
-        self._sitemap_fetch_retries = max(1, int(config.sitemap.fetch_retries_per_sitemap))
-        self._sitemap_retry_base_seconds = max(0.0, float(config.sitemap.retry_base_seconds))
-        self._sitemap_max_xml_per_domain = max(1, int(config.sitemap.max_xml_per_domain))
-        self._sitemap_max_queue_per_sitemap = max(
-            1, int(config.sitemap.max_queue_per_sitemap)
-        )
-
-        # Backward-compat alias used by existing tests
-        self._sitemap_fetched = self._sitemap_done
 
     async def run(self, seed_urls: list[str], resume: bool = False) -> None:
         """Main entry point: initialize, seed, run workers, shutdown."""
@@ -229,39 +212,12 @@ class CrawlOrchestrator:
                     logger.debug("Robots check error for %s: %s", crawl_url.url, e)
                     continue
 
-                # ── Phase: Sitemap discovery (once per domain) ──
-                # Skip if we're close to time limit (sitemap can take a while)
-                sitemap_attempted = False
-                sitemap_did_request = False
-                time_left = max_time - (time.monotonic() - start_time)
-                if time_left > 30 and await self._reserve_sitemap_attempt(crawl_url.domain):
-                    sitemap_attempted = True
-                    sitemap_did_request = True
-                    try:
-                        sitemap_ok = await asyncio.wait_for(
-                            self._try_fetch_sitemap(crawl_url.domain, crawl_url.depth),
-                            timeout=30.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.debug("Sitemap fetch timeout for %s", crawl_url.domain)
-                        sitemap_ok = False
-                    await self._finalize_sitemap_attempt(crawl_url.domain, sitemap_ok)
-
                 if not allowed_by_robots:
                     self._profiler.record_robots_blocked(crawl_url.domain)
                     await self._frontier.release_issued_url(crawl_url)
                     reservation_finalized = True
                     continue
 
-                # If sitemap work was done for this domain, defer page fetch:
-                # put URL back and let worker take a fresh task.
-                if sitemap_attempted:
-                    await self._frontier.requeue_issued_url(crawl_url)
-                    await self._frontier.release_issued_url(
-                        crawl_url, to_cooling=sitemap_did_request
-                    )
-                    reservation_finalized = True
-                    continue
 
                 # ── Phase: Rate limit wait ──
                 self._profiler.worker_set_state(
@@ -342,116 +298,6 @@ class CrawlOrchestrator:
 
         # Worker done
         self._profiler.worker_set_state(worker_id, "done")
-
-    async def _reserve_sitemap_attempt(self, domain: str) -> bool:
-        """Try reserving sitemap work for a domain (dedup + retry throttling)."""
-        now = time.monotonic()
-        async with self._sitemap_lock:
-            if domain in self._sitemap_done or domain in self._sitemap_inflight:
-                return False
-
-            failures = self._sitemap_failures.get(domain, 0)
-            if failures >= self._sitemap_max_attempts:
-                self._sitemap_done.add(domain)
-                return False
-
-            retry_at = self._sitemap_next_retry_at.get(domain, 0.0)
-            if now < retry_at:
-                return False
-
-            self._sitemap_inflight.add(domain)
-            return True
-
-    async def _finalize_sitemap_attempt(self, domain: str, success: bool) -> None:
-        """Finalize sitemap attempt and apply bounded retry/backoff on failure."""
-        now = time.monotonic()
-        async with self._sitemap_lock:
-            self._sitemap_inflight.discard(domain)
-            if success:
-                self._sitemap_done.add(domain)
-                self._sitemap_next_retry_at.pop(domain, None)
-                return
-
-            failures = self._sitemap_failures.get(domain, 0) + 1
-            self._sitemap_failures[domain] = failures
-
-            if failures >= self._sitemap_max_attempts:
-                self._sitemap_done.add(domain)
-                self._sitemap_next_retry_at.pop(domain, None)
-            else:
-                backoff = self._sitemap_retry_base_seconds * (2 ** (failures - 1))
-                self._sitemap_next_retry_at[domain] = now + backoff
-
-    async def _wait_sitemap_slot(self, url: str) -> None:
-        """Rate-limit sitemap requests exactly like normal page fetches."""
-        wait_time = await self._politeness.wait_for_slot(url)
-        self._profiler.record_rate_wait(wait_time)
-
-    async def _try_fetch_sitemap(self, domain: str, current_depth: int) -> bool:
-        """Fetch sitemap for a domain if declared in robots.txt.
-
-        Strategy: queue up to 500 URLs per sitemap XML for crawling,
-        and mark ALL remaining URLs as seen in bloom so BFS won't
-        re-discover them later.
-        """
-        try:
-            robots = self._politeness.robots
-            sitemap_xml_urls = robots.get_sitemap_urls(domain)
-            if not sitemap_xml_urls:
-                return True
-
-            had_failure = False
-
-            for surl in sitemap_xml_urls[:self._sitemap_max_xml_per_domain]:
-                page_urls: Optional[list[str]] = None
-                for attempt in range(1, self._sitemap_fetch_retries + 1):
-                    page_urls = await robots.fetch_sitemap(
-                        surl, before_fetch=self._wait_sitemap_slot
-                    )
-                    if page_urls is not None:
-                        break
-
-                    if attempt < self._sitemap_fetch_retries:
-                        backoff = self._sitemap_retry_base_seconds * (2 ** (attempt - 1))
-                        await asyncio.sleep(backoff)
-
-                if page_urls is None:
-                    had_failure = True
-                    logger.debug(
-                        "Sitemap %s failed after %d attempts",
-                        surl, self._sitemap_fetch_retries,
-                    )
-                    continue
-
-                if not page_urls:
-                    continue
-
-                # Step 1: queue the first batch (enters bloom + queue)
-                to_queue = page_urls[:self._sitemap_max_queue_per_sitemap]
-                added = await self._frontier.add_urls(
-                    to_queue, depth=current_depth + 1
-                )
-
-                # Step 2: mark the rest as seen in bloom only (no queue)
-                remaining = page_urls[self._sitemap_max_queue_per_sitemap:]
-                new_in_bloom = 0
-                if remaining:
-                    new_in_bloom = await self._frontier.mark_seen(remaining)
-
-                total_new = added + new_in_bloom
-                self._profiler.record_discovered(
-                    domain, total_new, len(page_urls), from_sitemap=True
-                )
-
-                logger.debug(
-                    "Sitemap %s: %d URLs found, %d queued, %d bloom-only",
-                    surl, len(page_urls), added, new_in_bloom,
-                )
-            return not had_failure
-        except Exception as e:
-            logger.debug("Sitemap error for %s: %s", domain, e)
-            return False
-
 
     def _signal_shutdown(self) -> None:
         """Legacy shutdown — prefer the inline handler in run()."""

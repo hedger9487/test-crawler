@@ -61,13 +61,12 @@ async def test_5xx_robots_disallows_all():
 
 
 @pytest.mark.asyncio
-async def test_parse_rules_crawl_delay_and_sitemaps():
+async def test_parse_rules_crawl_delay():
     robots_text = "\n".join(
         [
             "User-agent: *",
             "Disallow: /private",
             "Crawl-delay: 7",
-            "Sitemap: https://example.com/sitemap.xml",
         ]
     )
     session = _FakeSession(
@@ -78,7 +77,6 @@ async def test_parse_rules_crawl_delay_and_sitemaps():
     assert await robots.is_allowed("https://example.com/public") is True
     assert await robots.is_allowed("https://example.com/private/x") is False
     assert await robots.get_crawl_delay("example.com") == 7.0
-    assert robots.get_sitemap_urls("example.com") == ["https://example.com/sitemap.xml"]
 
 
 @pytest.mark.asyncio
@@ -98,21 +96,6 @@ async def test_timeout_disallows_all():
     session = _FakeSession(exc=asyncio.TimeoutError())
     robots = RobotsHandler(user_agent="UA", session=session)
     assert await robots.is_allowed("https://example.com/x") is False
-
-
-@pytest.mark.asyncio
-async def test_fetch_sitemap_urlset_returns_urls():
-    sitemap = """
-    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-      <url><loc>https://example.com/a</loc></url>
-      <url><loc>https://example.com/b</loc></url>
-    </urlset>
-    """
-    session = _FakeSession({"https://example.com/sitemap.xml": (200, sitemap)})
-    robots = RobotsHandler(user_agent="UA", session=session)
-
-    urls = await robots.fetch_sitemap("https://example.com/sitemap.xml")
-    assert urls == ["https://example.com/a", "https://example.com/b"]
 
 
 @pytest.mark.asyncio

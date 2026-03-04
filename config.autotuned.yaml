@@ -15,12 +15,6 @@ politeness:
   max_qps: 0.5
   robots_cache_ttl: 86400
   robots_fetch_timeout: 10
-sitemap:
-  max_xml_per_domain: 3
-  max_queue_per_sitemap: 500
-  max_attempts_per_domain: 3
-  fetch_retries_per_sitemap: 3
-  retry_base_seconds: 0.5
 frontier:
   bloom_capacity: 100000000
   bloom_error_rate: 0.001

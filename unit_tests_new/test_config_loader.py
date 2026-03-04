@@ -8,7 +8,6 @@ def test_load_config_returns_defaults_when_file_missing(tmp_path: Path):
     assert config.crawler.concurrency == 200
     assert config.frontier.max_pending == 5_000_000
     assert config.notification.enabled is False
-    assert config.sitemap.max_queue_per_sitemap == 500
 
 
 def test_load_config_parses_known_keys_and_ignores_unknown(tmp_path: Path):
@@ -23,10 +22,6 @@ frontier:
 notification:
   enabled: true
   discord_webhook: "https://example.com/webhook"
-sitemap:
-  max_queue_per_sitemap: 321
-  fetch_retries_per_sitemap: 4
-  unknown_sitemap_field: ignored
 nonexistent:
   x: y
 """.strip()
@@ -37,5 +32,3 @@ nonexistent:
     assert config.frontier.max_pending == 999
     assert config.notification.enabled is True
     assert config.notification.discord_webhook == "https://example.com/webhook"
-    assert config.sitemap.max_queue_per_sitemap == 321
-    assert config.sitemap.fetch_retries_per_sitemap == 4

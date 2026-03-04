@@ -50,25 +50,6 @@ politeness:
   robots_fetch_timeout: 10
 
 # ============================================================
-# Sitemap Discovery
-# ============================================================
-sitemap:
-  # Max sitemap XML files to process per domain
-  max_xml_per_domain: 3
-
-  # Queue only first N URLs per sitemap XML; rest bloom-only
-  max_queue_per_sitemap: 500
-
-  # Max sitemap discovery attempts per domain (with backoff)
-  max_attempts_per_domain: 3
-
-  # Retries per sitemap XML fetch attempt
-  fetch_retries_per_sitemap: 3
-
-  # Exponential backoff base (seconds): 0.5, 1.0, 2.0, ...
-  retry_base_seconds: 0.5
-
-# ============================================================
 # Frontier
 # ============================================================
 frontier:

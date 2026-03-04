@@ -47,41 +47,7 @@ class _FakeFrontier:
 
 
 class _FakeRobots:
-    def __init__(self):
-        self.get_sitemap_calls = 0
-        self.fetch_sitemap_calls = 0
-
-    def get_sitemap_urls(self, _domain):
-        self.get_sitemap_calls += 1
-        return []
-
-    async def fetch_sitemap(self, _url, before_fetch=None):
-        self.fetch_sitemap_calls += 1
-        if before_fetch is not None:
-            await before_fetch(_url)
-        return []
-
-
-class _RetryingFakeRobots(_FakeRobots):
-    def __init__(self, responses):
-        super().__init__()
-        self._responses = list(responses)
-
-    def get_sitemap_urls(self, _domain):
-        self.get_sitemap_calls += 1
-        return ["https://example.com/sitemap.xml"]
-
-    async def fetch_sitemap(self, _url, before_fetch=None):
-        self.fetch_sitemap_calls += 1
-        if before_fetch is not None:
-            await before_fetch(_url)
-        return self._responses.pop(0) if self._responses else []
-
-
-class _SitemapFakeRobots(_FakeRobots):
-    def get_sitemap_urls(self, _domain):
-        self.get_sitemap_calls += 1
-        return ["https://blocked.com/sitemap.xml"]
+    pass
 
 
 class _FakePoliteness:
@@ -162,7 +128,6 @@ async def test_worker_success_pipeline_enqueues_links():
     )
     orchestrator._storage = _FakeStorage()
     orchestrator._profiler = _FakeProfiler()
-    orchestrator._sitemap_fetched.add("example.com")
     orchestrator._politeness = _FakePoliteness(orchestrator, events, can_crawl=True, wait=0.12)
     orchestrator._fetcher = _FakeFetcher(
         orchestrator,
@@ -219,7 +184,6 @@ async def test_worker_fetch_exception_saves_status_zero():
     )
     orchestrator._storage = _FakeStorage()
     orchestrator._profiler = _FakeProfiler()
-    orchestrator._sitemap_fetched.add("err.com")
     orchestrator._politeness = _FakePoliteness(orchestrator, events, can_crawl=True, wait=0.0)
     orchestrator._fetcher = _FakeFetcher(orchestrator, events, exc=RuntimeError("fetch boom"))
 
@@ -236,84 +200,4 @@ async def test_worker_fetch_exception_saves_status_zero():
     assert orchestrator._profiler.fetch_records[0][1] == 0
 
 
-@pytest.mark.asyncio
-async def test_worker_robots_blocked_still_runs_sitemap_once():
-    orchestrator = CrawlOrchestrator(Config())
-    events = []
-    orchestrator._frontier = _FakeFrontier(
-        [CrawlURL(url="https://blocked.com/a", domain="blocked.com", depth=0)]
-    )
-    orchestrator._storage = _FakeStorage()
-    orchestrator._profiler = _FakeProfiler()
-    orchestrator._politeness = _FakePoliteness(orchestrator, events, can_crawl=False, wait=0.2)
-    orchestrator._politeness.robots = _SitemapFakeRobots()
-    orchestrator._fetcher = _FakeFetcher(orchestrator, events, result=CrawlResult(url="x"))
 
-    start = time.monotonic()
-    await orchestrator._worker(worker_id=3, start_time=start, max_time=60)
-
-    assert orchestrator._politeness.robots.get_sitemap_calls == 1
-    assert orchestrator._politeness.robots.fetch_sitemap_calls == 1
-    assert ("wait_for_slot", "https://blocked.com/sitemap.xml") in events
-    assert orchestrator._profiler.robots_blocked == 1
-    assert orchestrator._fetcher.calls == 0
-    assert orchestrator._profiler.rate_waits == [0.2]
-    assert len(orchestrator._frontier.released) == 1
-
-
-@pytest.mark.asyncio
-async def test_try_fetch_sitemap_retries_and_queues_urls():
-    orchestrator = CrawlOrchestrator(Config())
-    events = []
-    orchestrator._frontier = _FakeFrontier([])
-    orchestrator._storage = _FakeStorage()
-    orchestrator._profiler = _FakeProfiler()
-    orchestrator._politeness = _FakePoliteness(orchestrator, events, can_crawl=True, wait=0.05)
-    orchestrator._politeness.robots = _RetryingFakeRobots(
-        responses=[None, None, ["https://example.com/a", "https://example.com/b"]]
-    )
-    orchestrator._fetcher = _FakeFetcher(orchestrator, events, result=CrawlResult(url="x"))
-
-    ok = await orchestrator._try_fetch_sitemap("example.com", current_depth=0)
-
-    assert ok is True
-    assert orchestrator._politeness.robots.fetch_sitemap_calls == 3
-    assert orchestrator._frontier.added == [
-        (["https://example.com/a", "https://example.com/b"], 1)
-    ]
-    assert orchestrator._profiler.discovered == [("example.com", 2, 2)]
-    sitemap_waits = [event for event in events if event[0] == "wait_for_slot"]
-    assert len(sitemap_waits) == 3
-
-
-@pytest.mark.asyncio
-async def test_worker_sitemap_then_requeue_then_fetch_page():
-    orchestrator = CrawlOrchestrator(Config())
-    events = []
-    url = "https://example.com/start"
-    orchestrator._frontier = _FakeFrontier([CrawlURL(url=url, domain="example.com", depth=0)])
-    orchestrator._storage = _FakeStorage()
-    orchestrator._profiler = _FakeProfiler()
-    orchestrator._politeness = _FakePoliteness(orchestrator, events, can_crawl=True, wait=0.12)
-    orchestrator._politeness.robots = _SitemapFakeRobots()
-    orchestrator._fetcher = _FakeFetcher(
-        orchestrator,
-        events,
-        result=CrawlResult(
-            url=url,
-            status=200,
-            content_type="text/html",
-            html="<a href='/next'>next</a>",
-            elapsed_ms=15,
-        ),
-    )
-
-    start = time.monotonic()
-    await orchestrator._worker(worker_id=4, start_time=start, max_time=60)
-
-    assert len(orchestrator._frontier.requeued) == 1
-    assert len(orchestrator._frontier.released) == 1
-    assert len(orchestrator._frontier.marked_acquired) == 1
-    assert orchestrator._fetcher.calls == 1
-    assert events.count(("fetch", url)) == 1
-    assert ("wait_for_slot", "https://blocked.com/sitemap.xml") in events

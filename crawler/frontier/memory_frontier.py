@@ -391,24 +391,6 @@ class MemoryFrontier(AbstractFrontier):
 
         return True
 
-    async def mark_seen(self, urls: list[str]) -> int:
-        """Add URLs to bloom filter WITHOUT queuing them.
-
-        Used by sitemap: marks URLs as 'seen' so BFS won't re-discover
-        them, but doesn't put them in the crawl queue.
-
-        Returns the number of genuinely new URLs added to bloom.
-        """
-        count = 0
-        async with self._lock:
-            for url in urls:
-                normalized = normalize_url(url)
-                if normalized is None:
-                    continue
-                if self._bloom.add(normalized):
-                    count += 1
-        return count
-
     async def get_next(self) -> Optional[CrawlURL]:
         """Get the next URL to crawl.
 
@@ -484,7 +466,7 @@ class MemoryFrontier(AbstractFrontier):
     async def requeue_issued_url(self, item: CrawlURL) -> bool:
         """Put an already-issued URL back into the domain queue.
 
-        Used when worker decides to defer the page fetch (e.g., after sitemap).
+        Used when worker decides to defer the page fetch (e.g., after a transient error).
         This must NOT hit bloom dedup; the URL is already known.
         """
         if item is None or not item.url:
