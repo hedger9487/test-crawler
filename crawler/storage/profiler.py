@@ -19,12 +19,19 @@ import collections
 import json
 import logging
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List, Set
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of distinct referrer domains tracked per target domain.
+# log10(10 + 10_000) ≈ 4.0  vs  log10(10 + 1_000_000) ≈ 6.0 — the
+# marginal authority gain past this point is minimal, and each entry beyond
+# it costs only 8 bytes (interned pointer), so 10 000 is a safe ceiling.
+_MAX_REFERRERS_PER_DOMAIN = 10_000
 
 
 @dataclass
@@ -175,10 +182,18 @@ class CrawlProfiler:
 
         Updates in-degree referrers for each destination, enabling
         authority scoring via log10(10 + in_degree).
+
+        Domain strings are interned so every copy of e.g. "example.com"
+        shares one Python object, keeping set entries at 8 bytes each.
+        Referrers per domain are capped at _MAX_REFERRERS_PER_DOMAIN;
+        log10 compression makes anything beyond ~10 000 rounding error.
         """
+        src = sys.intern(source_domain)
         for dest in dest_domains:
             if dest and dest != source_domain:
-                self._domain_in_degree_referrers[dest].add(source_domain)
+                bucket = self._domain_in_degree_referrers[sys.intern(dest)]
+                if len(bucket) < _MAX_REFERRERS_PER_DOMAIN:
+                    bucket.add(src)
 
     def record_robots_blocked(self, domain: str) -> None:
         self._robots_blocked += 1
