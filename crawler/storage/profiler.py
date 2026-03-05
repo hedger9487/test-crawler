@@ -399,21 +399,29 @@ class CrawlProfiler:
   🏆 TOP DOMAINS (by URLs/sec)"""
 
         for d in top_domains:
+            prio = (
+                self._frontier_ref.get_effective_priority(d["domain"])
+                if self._frontier_ref else d["urls_per_sec"]
+            )
             report += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
-                f"crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}"
+                f"crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}  prio:{prio:.3f}"
             )
 
         report += f"""
 
   🔢 TOP CRAWLED DOMAINS"""
         for d in top_crawled:
+            prio = (
+                self._frontier_ref.get_effective_priority(d["domain"])
+                if self._frontier_ref else d["urls_per_sec"]
+            )
             report += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
-                f"ups:{d['urls_per_sec']:>6.2f}"
+                f"ups:{d['urls_per_sec']:>6.2f}  prio:{prio:.3f}"
             )
 
         report += f"\n{sep}"
