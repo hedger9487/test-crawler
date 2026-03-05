@@ -25,6 +25,23 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
+# ── Scoring weights ──
+# score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
+#   Y_ext: new URLs pointing to OTHER domains (cross-site discovery) ← heavily rewarded
+#   Y_int: new URLs within the SAME domain (internal graph)          ← minimal weight
+#   T:     total fetch time in seconds (failures/timeouts burn T without yield)
+_EXT_W: int = 10
+_INT_W: int = 1
+
+# ── Depth penalty ──
+# Penalty = 1 / (1 + max(0, url_depth - _URL_DEPTH_FREE))
+# url_depth = number of '/' in the FULL URL string (including https://):
+#   https://example.com/              → 3   (homepage)
+#   https://example.com/sports/2026/03/news/  → 7
+# Depths ≤ _URL_DEPTH_FREE are penalty-free (penalty = 1.0).
+# Examples: depth 4 → 1.0 | depth 6 → 0.33 | depth 8 → 0.2
+_URL_DEPTH_FREE: int = 4
+
 
 @dataclass
 class WorkerSnapshot:
@@ -100,6 +117,10 @@ class CrawlProfiler:
         # ── Frontier scheduling ──
         self._frontier_cooldown_skips: int = 0
         self._frontier_ref = None  # set via set_frontier_ref()
+
+        # ── Effective (penalised) domain scores — updated each report cycle ──
+        # Populated by _sync_frontier(); used by get_top_domains() for sorting.
+        self._domain_effective_score: Dict[str, float] = {}
 
         # ── Time-series for analysis ──
         # List of (timestamp, urls_crawled, urls_discovered, urls_success)
@@ -182,52 +203,74 @@ class CrawlProfiler:
     def get_domain_score(self, domain: str) -> float:
         """Compute scheduling priority score for a domain.
 
-        score = Y_weighted / T
+        score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
 
-          Y_weighted = Y_ext × 10 + Y_int
-            External links are weighted 10× higher than internal links:
-            a domain that consistently links OUT to other sites is a
-            hub — more valuable for broad discovery than a deep-nesting
-            site that only links to itself.
+          Y_ext × _EXT_W: external links heavily rewarded — cross-site hubs
+            drive organic discovery of new domains.
+          Y_int × _INT_W: internal links given minimal weight — they only
+            deepen the current domain rather than expanding coverage.
+          T: total fetch time — failed/timeout attempts increase T without
+             contributing yield, automatically penalising error-heavy domains.
 
-          T = total fetch time (seconds) across all attempts
-            Failed attempts / timeouts burn T without contributing to Y,
-            so error-heavy domains are penalised automatically.
-
-        Returns 1.0 for unexplored domains (neutral / Explore tier entry).
+        Returns 1.0 for unexplored domains (neutral Explore-tier entry).
         """
         total_time_s = self._domain_total_time_s.get(domain, 0.0)
         if total_time_s == 0.0:
-            return 1.0  # unexplored — neutral score, will enter Explore tier anyway
+            return 1.0
 
         y_int = self._domain_yield_internal.get(domain, 0)
         y_ext = self._domain_yield_external.get(domain, 0)
-        weighted_yield = y_ext * 10 + y_int
+        return (y_ext * _EXT_W + y_int * _INT_W) / total_time_s
 
-        return weighted_yield / total_time_s
+    @staticmethod
+    def _depth_penalty(url_depth: int) -> float:
+        """Penalty multiplier based on the shallowest URL depth in the domain queue.
 
-    def get_top_domains(self, n: int = 20) -> List[Dict]:
-        """Get top N domains by score (weighted URLs/sec × authority)."""
-        all_domains = (
-            set(self._domain_crawl_count)
-            | set(self._domain_yield_internal)
-            | set(self._domain_yield_external)
-        )
+        Penalty = 1 / (1 + max(0, url_depth - _URL_DEPTH_FREE))
+        Depths ≤ _URL_DEPTH_FREE → 1.0 (no penalty).
+        """
+        return 1.0 / (1.0 + max(0, url_depth - _URL_DEPTH_FREE))
+
+    def get_domain_ups(self, domain: str) -> float:
+        """URLs-per-second: (Y_ext + Y_int) / T, unweighted.
+
+        Pure throughput — how many new URLs this domain discovers per second
+        of fetch time, regardless of whether they are internal or external.
+        Returns 0.0 if the domain has never been timed.
+        """
+        total_time_s = self._domain_total_time_s.get(domain, 0.0)
+        if total_time_s == 0.0:
+            return 0.0
+        y_int = self._domain_yield_internal.get(domain, 0)
+        y_ext = self._domain_yield_external.get(domain, 0)
+        return (y_ext + y_int) / total_time_s
+
+    def get_top_domains(self, n: int = 50) -> List[Dict]:
+        """Get top N domains sorted by effective (depth-penalised) discovery score.
+
+        Only includes domains with at least one recorded crawl attempt.
+        Pass a large n so the caller can filter further (e.g. empty-queue domains)
+        and still have enough candidates to fill a fixed display quota.
+        """
         scored = []
-        for domain in all_domains:
-            crawls = self._domain_crawl_count.get(domain, 0)
+        for domain, crawls in self._domain_crawl_count.items():
+            if crawls == 0:
+                continue
             y_int = self._domain_yield_internal.get(domain, 0)
             y_ext = self._domain_yield_external.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
+            # Use the last-computed effective score (raw × depth_penalty).
+            # Falls back to raw score when _sync_frontier hasn't run yet (e.g. tests).
+            eff = self._domain_effective_score.get(domain, self.get_domain_score(domain))
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
                 "yield_int": y_int,
                 "yield_ext": y_ext,
                 "errors": errors,
-                "urls_per_sec": round(self.get_domain_score(domain), 3),
+                "score": round(eff, 3),
             })
-        scored.sort(key=lambda x: x["urls_per_sec"], reverse=True)
+        scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:n]
 
     def get_most_crawled_domains(self, n: int = 5) -> List[Dict]:
@@ -240,7 +283,7 @@ class CrawlProfiler:
                 "crawls": crawls,
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
-                "urls_per_sec": round(self.get_domain_score(domain), 3),
+                "score": round(self.get_domain_score(domain), 3),
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
         return rows[:n]
@@ -256,6 +299,74 @@ class CrawlProfiler:
         c = min(f + 1, len(sorted_data) - 1)
         d = k - f
         return sorted_data[f] + d * (sorted_data[c] - sorted_data[f])
+
+    # ── Reporting helpers ──
+
+    def _sync_frontier(self) -> tuple[int, dict]:
+        """Sync frontier stats, compute depth-penalised scores, push to scheduler.
+
+        Effective score = raw_score × depth_penalty(shallowest URL in domain queue)
+        Stored in _domain_effective_score for use by get_top_domains().
+        Returns (dropped, states).
+        """
+        if not self._frontier_ref:
+            return 0, {}
+        self._frontier_cooldown_skips = self._frontier_ref.cooldown_skips
+        frontier_dropped = getattr(self._frontier_ref, 'urls_dropped', 0)
+        frontier_states = getattr(self._frontier_ref, 'state_stats', {})
+        if callable(frontier_states):
+            frontier_states = {}
+        scores: dict[str, float] = {}
+        for domain in self._domain_crawl_count:
+            raw = self.get_domain_score(domain)
+            min_depth = self._frontier_ref.get_domain_min_url_depth(domain)
+            penalty = self._depth_penalty(min_depth)
+            eff = raw * penalty
+            self._domain_effective_score[domain] = eff
+            scores[domain] = eff
+        if scores:
+            self._frontier_ref.update_domain_priorities(scores)
+        return frontier_dropped, frontier_states
+
+    def _format_top_domains_section(self, top_domains: List[Dict]) -> str:
+        """Render the TOP DOMAINS table lines.
+
+        Always shows exactly 5 entries (or fewer if not enough candidates).
+        Domains with empty frontier queues are skipped.
+        """
+        visible: List[Dict] = []
+        has_queue_check = (
+            self._frontier_ref
+            and hasattr(self._frontier_ref, "domain_has_queued_urls")
+        )
+        for d in top_domains:
+            if has_queue_check and not self._frontier_ref.domain_has_queued_urls(d["domain"]):
+                continue
+            visible.append(d)
+            if len(visible) == 5:
+                break
+        lines = "\n\n  \U0001f3c6 TOP DOMAINS (by discovery score)"
+        for d in visible:
+            ups = self.get_domain_ups(d["domain"])
+            lines += (
+                f"\n    {d['domain'][:33]:<33} "
+                f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
+                f"crawls:{d['crawls']:>4}  score:{d['score']:.2f}  ups:{ups:.2f}"
+            )
+        return lines
+
+    def _format_top_crawled_section(self, top_crawled: List[Dict]) -> str:
+        """Render the TOP CRAWLED DOMAINS table lines."""
+        lines = "\n\n  \U0001f522 TOP CRAWLED DOMAINS"
+        for d in top_crawled:
+            ups = self.get_domain_ups(d["domain"])
+            lines += (
+                f"\n    {d['domain'][:33]:<33} "
+                f"crawls:{d['crawls']:>5}  "
+                f"succ:{d['success_rate']:>5.1f}%  "
+                f"score:{d['score']:>6.2f}  ups:{ups:.2f}"
+            )
+        return lines
 
     # ── Reporting ──
 
@@ -283,22 +394,7 @@ class CrawlProfiler:
                 logger.error("Profiler report error: %s", e)
 
     async def _print_report(self, final: bool = False) -> None:
-        # Sync frontier stats and push yield scores
-        frontier_dropped = 0
-        frontier_states = {}
-        if self._frontier_ref:
-            self._frontier_cooldown_skips = self._frontier_ref.cooldown_skips
-            frontier_dropped = getattr(self._frontier_ref, 'urls_dropped', 0)
-            frontier_states = getattr(self._frontier_ref, 'state_stats', {})
-            if hasattr(frontier_states, '__call__'):
-                frontier_states = {}
-
-            # Push yield scores to frontier for priority scheduling
-            scores = {}
-            for domain in self._domain_crawl_count:
-                scores[domain] = self.get_domain_score(domain)
-            if scores:
-                self._frontier_ref.update_domain_priorities(scores)
+        frontier_dropped, frontier_states = self._sync_frontier()
 
         elapsed = time.monotonic() - self._start_time
         hours = int(elapsed // 3600)
@@ -309,57 +405,51 @@ class CrawlProfiler:
         success_rate = (self._urls_success / max(self._urls_crawled, 1)) * 100
         discovery_rate = self._urls_discovered / max(self._urls_success, 1)
 
-        # Worker utilization
         worker_states = collections.Counter(
             snap.state for snap in self._worker_states.values()
         )
         n = max(self._num_workers, 1)
-        active_pct = (worker_states.get("fetching", 0) + worker_states.get("parsing", 0)) / n * 100
+        active_pct       = (worker_states.get("fetching", 0) + worker_states.get("parsing", 0)) / n * 100
         waiting_robots_pct = worker_states.get("waiting_robots", 0) / n * 100
-        waiting_rate_pct = worker_states.get("waiting_rate_limit", 0) / n * 100
-        idle_pct = (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0)) / n * 100
+        waiting_rate_pct   = worker_states.get("waiting_rate_limit", 0) / n * 100
+        idle_pct           = (worker_states.get("idle", 0) + worker_states.get("waiting_frontier", 0)) / n * 100
 
-        # Latency percentiles
-        recent_latencies = list(self._latencies)[-1000:]  # last 1000 for recency
+        recent_latencies = list(self._latencies)[-1000:]
         p50 = self._percentile(recent_latencies, 50)
         p95 = self._percentile(recent_latencies, 95)
         p99 = self._percentile(recent_latencies, 99)
 
-        # Status distribution (top 5)
         status_sorted = sorted(self._status_counts.items(), key=lambda x: -x[1])[:8]
         status_str = "  ".join(f"{s}:{c}" for s, c in status_sorted) if status_sorted else "none"
-
-        # Average rate limiter wait
         avg_rate_wait = self._total_rate_wait / max(self._rate_wait_count, 1)
 
-        # Top 5 domains by yield
-        top_domains = self.get_top_domains(5)
+        top_domains = self.get_top_domains(50)  # large pool so queue-filter still yields 5
         top_crawled = self.get_most_crawled_domains(5)
 
-        header = "═══ FINAL CRAWL PROFILE ═══" if final else "─── CRAWL PROFILE ───"
-        sep = "═" * 50 if final else "─" * 50
+        header = "\u2550\u2550\u2550 FINAL CRAWL PROFILE \u2550\u2550\u2550" if final else "\u2500\u2500\u2500 CRAWL PROFILE \u2500\u2500\u2500"
+        sep    = "\u2550" * 50 if final else "\u2500" * 50
 
         report = f"""
 {header}
   Time:       {hours:02d}:{minutes:02d}:{seconds:02d}   QPS: {overall_qps:.2f}
 
-  📊 THROUGHPUT
+  \U0001f4ca THROUGHPUT
     Crawled:      {self._urls_crawled:>10,}
     Successful:   {self._urls_success:>10,}   ({success_rate:.1f}%)
     Errors:       {self._urls_error:>10,}
     Timeouts:     {self._urls_timeout:>10,}
     Robots blk:   {self._robots_blocked:>10,}
 
-  🔗 DISCOVERY
+  \U0001f517 DISCOVERY
     New URLs:     {self._urls_discovered:>10,}
     Dropped:      {frontier_dropped:>10,}   (frontier cap reached)
     Yield/page:   {discovery_rate:>10.1f}   (new URLs per successful page)
     Domains:      {len(self._domain_crawl_count):>10,}
 
-  ⏱  LATENCY (ms)
+  \u23f1  LATENCY (ms)
     p50: {p50:>8.0f}   p95: {p95:>8.0f}   p99: {p99:>8.0f}
 
-  👷 WORKERS ({self._num_workers} total)
+  \U0001f477 WORKERS ({self._num_workers} total)
     Active:       {active_pct:>8.1f}%   (fetching/parsing)
     Robots:       {waiting_robots_pct:>8.1f}%   (waiting for robots.txt)
     Rate wait:    {waiting_rate_pct:>8.1f}%
@@ -368,71 +458,38 @@ class CrawlProfiler:
     CD skips:     {self._frontier_cooldown_skips:>8,}   (forced cooling domain picks)
     Conn errs:    {self._status_counts.get(0, 0):>8,}   (status=0, network failures)
 
-  🔄 FRONTIER STATES
+  \U0001f504 FRONTIER STATES
     Ready:        {frontier_states.get('ready', 0):>8,}   (available for fetch)
     Reserved:     {frontier_states.get('reserved', 0):>8,}   (issued to workers)
     Cooling:      {frontier_states.get('cooling', 0):>8,}   (waiting for cooldown)
     Empty:        {frontier_states.get('empty', 0):>8,}   (no pending URLs)
-    Promotions:   {frontier_states.get('promotions', 0):>8,}   (cooling → ready)"""
+    Promotions:   {frontier_states.get('promotions', 0):>8,}   (cooling \u2192 ready)"""
 
-        # Diagnostic section
         diag_parts = []
         if self._frontier_ref:
-            issued = getattr(self._frontier_ref, '_issued_domains', [])
+            issued     = getattr(self._frontier_ref, '_issued_domains', [])
             unique_10k = len(set(issued)) if issued else 0
             stale_pops = getattr(self._frontier_ref, '_stale_pops', 0)
             diag_parts.append(f"    Stale pops:   {stale_pops:>8,}   (gen-mismatch skips)")
             diag_parts.append(f"    Unique/10K:   {unique_10k:>8,}   (unique domains in last 10K issued)")
         if self._issue_acquire_gaps:
-            gaps = list(self._issue_acquire_gaps)
+            gaps    = list(self._issue_acquire_gaps)
             avg_gap = sum(gaps) / len(gaps)
             p95_gap = self._percentile(gaps, 95)
-            diag_parts.append(f"    Issue→Acq:   {avg_gap:>7.3f}s avg, {p95_gap:.3f}s p95  (frontier→rate_limiter gap)")
+            diag_parts.append(f"    Issue\u2192Acq:   {avg_gap:>7.3f}s avg, {p95_gap:.3f}s p95  (frontier\u2192rate_limiter gap)")
         if diag_parts:
-            report += "\n\n  🔬 DIAGNOSTICS\n" + "\n".join(diag_parts)
+            report += "\n\n  \U0001f52c DIAGNOSTICS\n" + "\n".join(diag_parts)
 
-        report += f"""
-
-  📈 STATUS CODES
-    {status_str}
-
-  🏆 TOP DOMAINS (by URLs/sec)"""
-
-        for d in top_domains:
-            prio = (
-                self._frontier_ref.get_effective_priority(d["domain"])
-                if self._frontier_ref else d["urls_per_sec"]
-            )
-            report += (
-                f"\n    {d['domain'][:33]:<33} "
-                f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
-                f"crawls:{d['crawls']:>4}  ups:{d['urls_per_sec']:.2f}  prio:{prio:.3f}"
-            )
-
-        report += f"""
-
-  🔢 TOP CRAWLED DOMAINS"""
-        for d in top_crawled:
-            prio = (
-                self._frontier_ref.get_effective_priority(d["domain"])
-                if self._frontier_ref else d["urls_per_sec"]
-            )
-            report += (
-                f"\n    {d['domain'][:33]:<33} "
-                f"crawls:{d['crawls']:>5}  "
-                f"succ:{d['success_rate']:>5.1f}%  "
-                f"ups:{d['urls_per_sec']:>6.2f}  prio:{prio:.3f}"
-            )
-
+        report += f"\n\n  \U0001f4c8 STATUS CODES\n    {status_str}"
+        report += self._format_top_domains_section(top_domains)
+        report += self._format_top_crawled_section(top_crawled)
         report += f"\n{sep}"
         logger.info(report)
 
-        # Record time series point
         self._time_series.append((
             elapsed, self._urls_crawled, self._urls_discovered, self._urls_success
         ))
 
-        # Write JSONL snapshot for post-analysis
         if final:
             await self._write_final_report()
 

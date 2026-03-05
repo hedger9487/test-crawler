@@ -32,14 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class CrawlOrchestrator:
-    """Coordinates all crawler components and manages the crawl lifecycle.
-
-    Features:
-      - N async worker coroutines with state tracking
-      - Periodic checkpointing for crash recovery
-      - Comprehensive profiling via CrawlProfiler
-      - Dynamic domain priority adjustment (favor high-yield domains)
-    """
+    """Coordinates all crawler components and manages the crawl lifecycle."""
 
     def __init__(self, config: Config):
         self._config = config
@@ -51,7 +44,45 @@ class CrawlOrchestrator:
         self._politeness: Optional[PolitenessManager] = None
         self._storage: Optional[SQLiteStorage] = None
         self._profiler: Optional[CrawlProfiler] = None
+        self._worker_tasks: list[asyncio.Task] = []
 
+    def _build_components(self) -> None:
+        """Instantiate all crawler components from config."""
+        cfg = self._config
+        self._frontier = MemoryFrontier(
+            bloom_capacity=cfg.frontier.bloom_capacity,
+            bloom_error_rate=cfg.frontier.bloom_error_rate,
+            max_depth=cfg.frontier.max_depth,
+            max_pending=cfg.frontier.max_pending,
+        )
+        self._fetcher = AsyncFetcher(
+            user_agent=cfg.crawler.user_agent,
+            timeout=cfg.fetcher.timeout,
+            max_redirects=cfg.fetcher.max_redirects,
+            pool_size=cfg.fetcher.connection_pool_size,
+            per_host=cfg.fetcher.per_host_connections,
+            accept_content_types=cfg.fetcher.accept_content_types,
+            ssl_verify=cfg.fetcher.ssl_verify,
+        )
+        robots = RobotsHandler(
+            user_agent=cfg.crawler.user_agent,
+            cache_ttl=cfg.politeness.robots_cache_ttl,
+            fetch_timeout=cfg.politeness.robots_fetch_timeout,
+            ssl_verify=cfg.fetcher.ssl_verify,
+        )
+        rate_limiter = RateLimiter(max_qps=cfg.politeness.max_qps)
+        self._politeness = PolitenessManager(robots, rate_limiter)
+        self._storage = SQLiteStorage(
+            db_path=cfg.storage.db_path,
+            batch_size=cfg.storage.batch_size,
+        )
+        self._profiler = CrawlProfiler(
+            num_workers=cfg.crawler.concurrency,
+            report_interval=cfg.logging.stats_interval,
+        )
+        # Wire cooldown checker: frontier skips domains in cooldown
+        self._frontier.set_cooldown_checker(rate_limiter.peek_wait_time)
+        return robots
 
     async def run(self, seed_urls: list[str], resume: bool = False) -> None:
         """Main entry point: initialize, seed, run workers, shutdown."""
@@ -59,54 +90,13 @@ class CrawlOrchestrator:
         logger.info("Starting crawler with %d seeds, concurrency=%d",
                      len(seed_urls), concurrency)
 
-        # ── Initialize components ──
-        self._frontier = MemoryFrontier(
-            bloom_capacity=self._config.frontier.bloom_capacity,
-            bloom_error_rate=self._config.frontier.bloom_error_rate,
-            max_depth=self._config.frontier.max_depth,
-            max_pending=self._config.frontier.max_pending,
-        )
-
-        self._fetcher = AsyncFetcher(
-            user_agent=self._config.crawler.user_agent,
-            timeout=self._config.fetcher.timeout,
-            max_redirects=self._config.fetcher.max_redirects,
-            pool_size=self._config.fetcher.connection_pool_size,
-            per_host=self._config.fetcher.per_host_connections,
-            accept_content_types=self._config.fetcher.accept_content_types,
-            ssl_verify=self._config.fetcher.ssl_verify,
-        )
-
-        robots = RobotsHandler(
-            user_agent=self._config.crawler.user_agent,
-            cache_ttl=self._config.politeness.robots_cache_ttl,
-            fetch_timeout=self._config.politeness.robots_fetch_timeout,
-            ssl_verify=self._config.fetcher.ssl_verify,
-        )
-
-        rate_limiter = RateLimiter(max_qps=self._config.politeness.max_qps)
-
-        self._politeness = PolitenessManager(robots, rate_limiter)
-
-        self._storage = SQLiteStorage(
-            db_path=self._config.storage.db_path,
-            batch_size=self._config.storage.batch_size,
-        )
-
-        self._profiler = CrawlProfiler(
-            num_workers=concurrency,
-            report_interval=self._config.logging.stats_interval,
-        )
+        robots = self._build_components()
 
         # ── Start everything ──
         await self._storage.init()
         await self._fetcher.start()
-
         # Share the fetcher's session with robots handler
         robots.set_session(self._fetcher.session)
-
-        # Wire cooldown checker: frontier skips domains in cooldown
-        self._frontier.set_cooldown_checker(rate_limiter.peek_wait_time)
 
         await self._politeness.start()
         await self._profiler.start()
@@ -114,7 +104,7 @@ class CrawlOrchestrator:
 
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
-        self._worker_tasks: list[asyncio.Task] = []
+        self._worker_tasks = []
         self._got_signal = False
 
         def _handle_signal():
@@ -286,33 +276,8 @@ class CrawlOrchestrator:
 
                 # ── Phase: Parse & enqueue ──
                 if result.is_success and result.is_html and result.html:
-                    self._profiler.worker_set_state(
-                        worker_id, "parsing",
-                        url=crawl_url.url, domain=crawl_url.domain
-                    )
                     try:
-                        links = extract_links(result.html, crawl_url.url)
-                        source_domain = crawl_url.domain
-                        next_depth = crawl_url.depth + 1
-
-                        # Split discovered links into internal (same domain) and
-                        # external (other domains) before enqueueing.
-                        internal_links = [l for l in links if get_domain(l) == source_domain]
-                        external_links = [l for l in links if get_domain(l) != source_domain]
-
-                        internal_new = (
-                            await self._frontier.add_urls(internal_links, depth=next_depth)
-                            if internal_links else 0
-                        )
-                        external_new = (
-                            await self._frontier.add_urls(external_links, depth=next_depth)
-                            if external_links else 0
-                        )
-
-                        self._profiler.record_discovered(
-                            source_domain, internal_new, external_new,
-                        )
-
+                        await self._parse_and_enqueue(worker_id, crawl_url, result.html)
                     except Exception as e:
                         logger.debug("Parse/enqueue error for %s: %s", crawl_url.url, e)
             finally:
@@ -322,11 +287,38 @@ class CrawlOrchestrator:
         # Worker done
         self._profiler.worker_set_state(worker_id, "done")
 
+    async def _parse_and_enqueue(
+        self,
+        worker_id: int,
+        crawl_url: "CrawlURL",
+        html: str,
+    ) -> None:
+        """Extract links from HTML and enqueue new URLs into the frontier."""
+        self._profiler.worker_set_state(
+            worker_id, "parsing", url=crawl_url.url, domain=crawl_url.domain
+        )
+        source_domain = crawl_url.domain
+        next_depth = crawl_url.depth + 1
+        links = extract_links(html, crawl_url.url)
+
+        internal_links = [l for l in links if get_domain(l) == source_domain]
+        external_links = [l for l in links if get_domain(l) != source_domain]
+
+        internal_new = (
+            await self._frontier.add_urls(internal_links, depth=next_depth)
+            if internal_links else 0
+        )
+        external_new = (
+            await self._frontier.add_urls(external_links, depth=next_depth)
+            if external_links else 0
+        )
+        self._profiler.record_discovered(source_domain, internal_new, external_new)
+
     def _signal_shutdown(self) -> None:
-        """Legacy shutdown — prefer the inline handler in run()."""
+        """Trigger graceful shutdown (can be called externally)."""
         logger.info("⚡ Shutdown signal received — cancelling workers...")
         self._shutdown = True
-        for t in getattr(self, '_worker_tasks', []):
+        for t in self._worker_tasks:
             t.cancel()
 
     async def _checkpoint_loop(self, path: str) -> None:

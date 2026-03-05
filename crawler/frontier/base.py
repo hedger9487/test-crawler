@@ -13,7 +13,10 @@ class CrawlURL:
     url: str
     domain: str
     depth: int = 0       # BFS hop depth from seed
-    url_depth: int = 0   # URL path depth: url.count('/') — proxy for page nesting level
+    url_depth: int = 0   # Full-URL slash count (includes https:// prefix):
+                          # https://example.com/          → 3
+                          # https://example.com/sports/x/ → 6
+                          # Used for within-domain queue ordering (shallow first).
     priority: float = 0.0   # reserved for caller overrides (not used by default scheduler)
     issue_time: float = 0.0  # set by frontier at dispatch time
     reservation_id: int = 0  # set by frontier when domain enters Reserved

@@ -233,6 +233,21 @@ class MemoryFrontier(AbstractFrontier):
         """Return the current scheduling priority score for a domain (public accessor)."""
         return self._effective_priority(domain)
 
+    def domain_has_queued_urls(self, domain: str) -> bool:
+        """Return True if the domain still has at least one URL waiting in its queue."""
+        return bool(self._domain_queues.get(domain))
+
+    def get_domain_min_url_depth(self, domain: str) -> int:
+        """Return the url_depth of the shallowest URL in the domain's queue.
+
+        The domain queue is a min-heap sorted by (depth, url_depth), so index 0
+        is always the shallowest pending URL.  Returns 0 if the queue is empty.
+        """
+        queue = self._domain_queues.get(domain)
+        if not queue:
+            return 0
+        return queue[0].url_depth
+
     def _push_ready(self, domain: str) -> None:
         """Push domain into Ready heaps.
 
@@ -279,6 +294,32 @@ class MemoryFrontier(AbstractFrontier):
             self._push_cooling(domain, cooldown)
         else:
             self._push_ready(domain)
+
+    def _issue_from_cooling_forced(self, t_acquired: float) -> Optional["CrawlURL"]:
+        """Pop the soonest cooling domain and issue its next URL, bypassing cooldown.
+
+        Called only when all Ready heaps are empty — minimises worker idle time
+        at the cost of skipping the politeness cooldown for one request.
+        Records a cooldown_skip for monitoring.
+        """
+        if not self._cooling:
+            return None
+        _, _, domain = heapq.heappop(self._cooling)
+        queue = self._domain_queues.get(domain)
+        if not queue:
+            self._set_empty(domain)
+            self._lock_hold_total += time.monotonic() - t_acquired
+            return None
+        item = heapq.heappop(queue)
+        item.issue_time = time.monotonic()
+        self._pending_count -= 1
+        self._cooldown_skips += 1
+        self._issued_domains.append(domain)
+        self._domain_issue_count[domain] += 1
+        self._ready_dispatch_count += 1
+        item = self._start_reservation_locked(domain, item)
+        self._lock_hold_total += time.monotonic() - t_acquired
+        return item
 
     def _issue_from_ready_domain_locked(self, domain: str) -> Optional[CrawlURL]:
         """Issue one URL from a ready domain while holding frontier lock.
@@ -413,9 +454,12 @@ class MemoryFrontier(AbstractFrontier):
 
         domain = get_domain(normalized) or "unknown"
 
-        # url_depth: count slashes in the full URL as a proxy for path nesting.
-        # e.g. https://example.com/a/b/c  → 5 slashes
-        # Shallow URLs (homepage, top-level sections) are preferred within a domain.
+        # url_depth: count ALL slashes in the full URL string.
+        # This includes the two from https:// so baselines are:
+        #   https://example.com/          → 3
+        #   https://example.com/page      → 3
+        #   https://example.com/a/b/c/    → 6
+        # Shallow URLs (small url_depth) are preferred within a domain queue.
         url_depth = normalized.count("/")
 
         crawl_url = CrawlURL(
@@ -484,26 +528,8 @@ class MemoryFrontier(AbstractFrontier):
                     self._lock_hold_total += time.monotonic() - t_acquired
                     return item
 
-            # No ready domains — check if any cooling domains exist
-            # If so, pop the soonest one (minimize worker idle time)
-            if self._cooling:
-                _, _, domain = heapq.heappop(self._cooling)
-                queue = self._domain_queues.get(domain)
-                if queue:
-                    item = heapq.heappop(queue)
-                    item.issue_time = time.monotonic()
-                    self._pending_count -= 1
-                    self._cooldown_skips += 1  # counts as "forced skip of cooldown"
-                    self._issued_domains.append(domain)
-                    self._domain_issue_count[domain] += 1
-                    self._ready_dispatch_count += 1
-                    item = self._start_reservation_locked(domain, item)
-
-                    self._lock_hold_total += time.monotonic() - t_acquired
-                    return item
-
-            self._lock_hold_total += time.monotonic() - t_acquired
-            return None  # frontier truly empty
+            # No ready domains — try the soonest cooling domain to avoid idle
+            return self._issue_from_cooling_forced(t_acquired)
 
     async def requeue_issued_url(self, item: CrawlURL) -> bool:
         """Put an already-issued URL back into the domain queue and release

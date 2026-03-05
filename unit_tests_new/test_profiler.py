@@ -29,7 +29,7 @@ def test_score_is_zero_when_domain_has_attempts_but_no_yield():
 
 
 def test_score_equals_yield_divided_by_total_time():
-    """score = Y_weighted / T  where Y_weighted = Y_ext*10 + Y_int."""
+    """score = (Y_ext*_EXT_W + Y_int*_INT_W) / T"""
     p = _make_profiler()
     # 3 attempts × 1 000 ms each → total_time_s = 3.0
     for _ in range(3):
@@ -37,29 +37,31 @@ def test_score_equals_yield_divided_by_total_time():
     # 6 internal URLs discovered, no external
     p.record_discovered("a.com", internal_new=6, external_new=0)
 
-    # Y_weighted = 6*1 + 0*10 = 6
+    # Y_weighted = 0*10 + 6*1 = 6
     expected = 6 / 3.0  # = 2.0
     assert p.get_domain_score("a.com") == pytest.approx(expected)
 
 
-def test_external_links_weighted_10x_over_internal():
+def test_link_weights_ext10_int1():
     """
-    Two domains with identical latency and total link count:
-    the one that discovered external links scores 10× higher than
-    the pure-internal domain (same time, same total yield).
+    Verify the scoring weights:
+      external link: _EXT_W = 10  (cross-site hub, heavily rewarded)
+      internal link: _INT_W = 1   (only deepens current domain, minimal weight)
+    With equal link counts and latency:
+      hub.com  (5 ext)  score = 5*10 / 1.0 = 50
+      silo.com (5 int)  score = 5*1  / 1.0 = 5
+    So external-hub scores 10× internal-only.
     """
     p = _make_profiler()
 
-    # hub.com: 1 s fetch, 5 external URLs discovered
     p.record_fetch("hub.com", status=200, latency_ms=1_000.0, is_html=True)
     p.record_discovered("hub.com", internal_new=0, external_new=5)
 
-    # silo.com: 1 s fetch, 5 internal URLs discovered
     p.record_fetch("silo.com", status=200, latency_ms=1_000.0, is_html=True)
     p.record_discovered("silo.com", internal_new=5, external_new=0)
 
-    # hub.com: Y_weighted = 5*10 = 50, silo.com: Y_weighted = 5*1 = 5
-    assert p.get_domain_score("hub.com") == pytest.approx(50 / 1.0)
+    # hub.com: Y = 5*10 = 50; silo.com: Y = 5*1 = 5
+    assert p.get_domain_score("hub.com")  == pytest.approx(50 / 1.0)
     assert p.get_domain_score("silo.com") == pytest.approx(5 / 1.0)
     assert p.get_domain_score("hub.com") == pytest.approx(
         p.get_domain_score("silo.com") * 10
@@ -176,7 +178,7 @@ def test_record_fetch_accumulates_time_across_attempts():
 # get_top_domains / get_most_crawled_domains
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_get_top_domains_sorted_by_urls_per_sec_descending():
+def test_get_top_domains_sorted_by_score_descending():
     p = _make_profiler()
 
     p.record_fetch("a.com", status=200, latency_ms=1_000.0, is_html=True)
@@ -199,7 +201,7 @@ def test_get_top_domains_row_contains_expected_keys():
     p.record_discovered("x.com", internal_new=2, external_new=0)
 
     row = p.get_top_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "score"}
 
 
 def test_get_top_domains_n_limits_results():
@@ -230,7 +232,7 @@ def test_get_most_crawled_domains_row_contains_expected_keys():
     p.record_fetch("k.com", status=200, latency_ms=300.0, is_html=True)
 
     row = p.get_most_crawled_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "urls_per_sec"}
+    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "score"}
 
 
 def test_get_most_crawled_domains_success_rate_calculation():
