@@ -126,10 +126,15 @@ class MemoryFrontier(AbstractFrontier):
 
         # ── Domain state management ──
 
-        # Ready: max-heap by yield score.
+        # Ready: two heaps for 50/50 Explore/Mature interleaving.
+        # Explore tier (issue_count < _EXPLORE_ISSUE_LIMIT): flat _EXPLORE_PRIORITY.
+        # Mature tier (issue_count >= _EXPLORE_ISSUE_LIMIT): scored by Y/T.
         # Stored as (-yield_score, gen, tie_breaker, domain) for min-heap.
-        # gen = per-domain generation to detect stale entries.
-        self._ready: list[tuple[float, int, int, str]] = []
+        self._ready_explore: list[tuple[float, int, int, str]] = []
+        self._ready_mature:  list[tuple[float, int, int, str]] = []
+        # Alternates between Explore and Mature on each dispatch.
+        # When only one heap is non-empty the other is used as fallback.
+        self._dispatch_parity: int = 0
 
         # Cooling: min-heap by ready_at timestamp.
         # Stored as (ready_at, tie_breaker, domain).
@@ -222,12 +227,16 @@ class MemoryFrontier(AbstractFrontier):
         return min(score, _MAX_SCORE_PRIORITY)
 
     def _push_ready(self, domain: str) -> None:
-        """Push domain into the Ready heap."""
+        """Push domain into the appropriate Ready heap (Explore or Mature)."""
         self._reserved.pop(domain, None)
         score = self._effective_priority(domain)
         gen = self._domain_ready_gen[domain] + 1
         self._domain_ready_gen[domain] = gen
-        heapq.heappush(self._ready, (-score, gen, self._next_tie(), domain))
+        entry = (-score, gen, self._next_tie(), domain)
+        if score >= _EXPLORE_PRIORITY:
+            heapq.heappush(self._ready_explore, entry)
+        else:
+            heapq.heappush(self._ready_mature, entry)
         self._domain_state[domain] = "ready"
 
     def _start_reservation_locked(self, domain: str, item: CrawlURL) -> CrawlURL:
@@ -303,11 +312,12 @@ class MemoryFrontier(AbstractFrontier):
                 self._set_empty(domain)
 
     def _rebuild_ready_heap(self) -> None:
-        """Rebuild Ready heap from current ready domains using latest scores."""
+        """Rebuild both Ready heaps with latest scores."""
         if not self._needs_ready_rebuild:
             return
 
-        entries: list[tuple[float, int, int, str]] = []
+        explore_entries: list[tuple[float, int, int, str]] = []
+        mature_entries:  list[tuple[float, int, int, str]] = []
         to_empty: list[str] = []
 
         for domain, state in self._domain_state.items():
@@ -320,13 +330,19 @@ class MemoryFrontier(AbstractFrontier):
             score = self._effective_priority(domain)
             gen = self._domain_ready_gen[domain] + 1
             self._domain_ready_gen[domain] = gen
-            entries.append((-score, gen, self._next_tie(), domain))
+            entry = (-score, gen, self._next_tie(), domain)
+            if score >= _EXPLORE_PRIORITY:
+                explore_entries.append(entry)
+            else:
+                mature_entries.append(entry)
 
         for domain in to_empty:
             self._set_empty(domain)
 
-        heapq.heapify(entries)
-        self._ready = entries
+        heapq.heapify(explore_entries)
+        heapq.heapify(mature_entries)
+        self._ready_explore = explore_entries
+        self._ready_mature  = mature_entries
         self._needs_ready_rebuild = False
 
     # ── Core API ──
@@ -419,24 +435,35 @@ class MemoryFrontier(AbstractFrontier):
             self._promote_cooling()
             self._rebuild_ready_heap()
 
-            # Step 2: find a ready domain with URLs
-            # (stale entries in heap are possible if yield scores changed)
-            # Pure priority order: Explore-tier domains (issue_count < _EXPLORE_ISSUE_LIMIT)
-            # always outrank Mature domains because _EXPLORE_PRIORITY > _MAX_SCORE_PRIORITY.
-            while self._ready:
-                neg_score, gen, tie, domain = heapq.heappop(self._ready)
+            # Step 2: pick from Explore or Mature heap using 50/50 parity.
+            # When both heaps are non-empty: alternate each dispatch so new-domain
+            # exploration (robots uncached, high wait) is interleaved with mature
+            # domains (robots cached), halving the robots.txt bottleneck.
+            # When only one heap has entries: use it as the sole source (natural
+            # fallback — e.g. all domains are mature, or run is just starting).
+            prefer_mature = (
+                self._dispatch_parity % 2 == 1
+                and bool(self._ready_mature)
+                and bool(self._ready_explore)
+            )
+            self._dispatch_parity += 1
 
-                # Skip stale entries: gen must match current domain gen
-                if gen != self._domain_ready_gen.get(domain, 0):
-                    self._stale_pops += 1
-                    continue
-
-                item = self._issue_from_ready_domain_locked(domain)
-                if item is None:
-                    continue
-
-                self._lock_hold_total += time.monotonic() - t_acquired
-                return item
+            heaps = (
+                (self._ready_mature, self._ready_explore)
+                if prefer_mature
+                else (self._ready_explore, self._ready_mature)
+            )
+            for heap in heaps:
+                while heap:
+                    neg_score, gen, tie, domain = heapq.heappop(heap)
+                    if gen != self._domain_ready_gen.get(domain, 0):
+                        self._stale_pops += 1
+                        continue
+                    item = self._issue_from_ready_domain_locked(domain)
+                    if item is None:
+                        continue
+                    self._lock_hold_total += time.monotonic() - t_acquired
+                    return item
 
             # No ready domains — check if any cooling domains exist
             # If so, pop the soonest one (minimize worker idle time)
@@ -562,7 +589,7 @@ class MemoryFrontier(AbstractFrontier):
     def state_stats(self) -> dict:
         """Domain state distribution."""
         return {
-            "ready": len(self._ready),
+            "ready": len(self._ready_explore) + len(self._ready_mature),
             "reserved": len(self._reserved),
             "cooling": len(self._cooling),
             "empty": len(self._empty),
@@ -576,7 +603,8 @@ class MemoryFrontier(AbstractFrontier):
             state = {
                 "bloom": self._bloom,
                 "domain_queues": dict(self._domain_queues),
-                "ready": list(self._ready),
+                "ready_explore": list(self._ready_explore),
+                "ready_mature":  list(self._ready_mature),
                 "cooling": list(self._cooling),
                 "empty": set(self._empty),
                 "reserved": dict(self._reserved),
@@ -605,7 +633,15 @@ class MemoryFrontier(AbstractFrontier):
             self._domain_queues = collections.defaultdict(
                 list, state["domain_queues"]
             )
-            self._ready = state.get("ready", [])
+            # Support both new format (split heaps) and old checkpoints (merged).
+            if "ready_explore" in state:
+                self._ready_explore = state["ready_explore"]
+                self._ready_mature  = state["ready_mature"]
+            else:
+                # Old checkpoint: trigger full rebuild on first get_next().
+                self._ready_explore = []
+                self._ready_mature  = []
+                self._needs_ready_rebuild = True
             self._cooling = state.get("cooling", [])
             self._empty = state.get("empty", set())
             self._reserved = dict(state.get("reserved", {}))
