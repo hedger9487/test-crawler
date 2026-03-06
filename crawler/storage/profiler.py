@@ -25,22 +25,10 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# ── Scoring weights ──
-# score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
-#   Y_ext: new URLs pointing to OTHER domains (cross-site discovery) ← heavily rewarded
-#   Y_int: new URLs within the SAME domain (internal graph)          ← minimal weight
-#   T:     total fetch time in seconds (failures/timeouts burn T without yield)
-_EXT_W: int = 10
-_INT_W: int = 1
-
-# ── Depth penalty ──
-# Penalty = 1 / (1 + max(0, url_depth - _URL_DEPTH_FREE))
-# url_depth = number of '/' in the FULL URL string (including https://):
-#   https://example.com/              → 3   (homepage)
-#   https://example.com/sports/2026/03/news/  → 7
-# Depths ≤ _URL_DEPTH_FREE are penalty-free (penalty = 1.0).
-# Examples: depth 4 → 1.0 | depth 6 → 0.33 | depth 8 → 0.2
-_URL_DEPTH_FREE: int = 4
+# ── Scoring ──
+# score = (Y_ext + Y_int) / T   (URLs per second — UPS)
+#   Y_ext + Y_int: total new URLs discovered (internal + external)
+#   T:             total fetch time in seconds (failures/timeouts burn T without yield)
 
 
 @dataclass
@@ -117,10 +105,6 @@ class CrawlProfiler:
         # ── Frontier scheduling ──
         self._frontier_cooldown_skips: int = 0
         self._frontier_ref = None  # set via set_frontier_ref()
-
-        # ── Effective (penalised) domain scores — updated each report cycle ──
-        # Populated by _sync_frontier(); used by get_top_domains() for sorting.
-        self._domain_effective_score: Dict[str, float] = {}
 
         # ── Time-series for analysis ──
         # List of (timestamp, urls_crawled, urls_discovered, urls_success)
@@ -201,14 +185,11 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """Compute scheduling priority score for a domain.
+        """Compute scheduling priority score for a domain (UPS — URLs per second).
 
-        score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
+        score = (Y_ext + Y_int) / T
 
-          Y_ext × _EXT_W: external links heavily rewarded — cross-site hubs
-            drive organic discovery of new domains.
-          Y_int × _INT_W: internal links given minimal weight — they only
-            deepen the current domain rather than expanding coverage.
+          Y_ext + Y_int: total new URLs discovered across all crawls for this domain.
           T: total fetch time — failed/timeout attempts increase T without
              contributing yield, automatically penalising error-heavy domains.
 
@@ -218,29 +199,6 @@ class CrawlProfiler:
         if total_time_s == 0.0:
             return 1.0
 
-        y_int = self._domain_yield_internal.get(domain, 0)
-        y_ext = self._domain_yield_external.get(domain, 0)
-        return (y_ext * _EXT_W + y_int * _INT_W) / total_time_s
-
-    @staticmethod
-    def _depth_penalty(url_depth: int) -> float:
-        """Penalty multiplier based on the shallowest URL depth in the domain queue.
-
-        Penalty = 1 / (1 + max(0, url_depth - _URL_DEPTH_FREE))
-        Depths ≤ _URL_DEPTH_FREE → 1.0 (no penalty).
-        """
-        return 1.0 / (1.0 + max(0, url_depth - _URL_DEPTH_FREE))
-
-    def get_domain_ups(self, domain: str) -> float:
-        """URLs-per-second: (Y_ext + Y_int) / T, unweighted.
-
-        Pure throughput — how many new URLs this domain discovers per second
-        of fetch time, regardless of whether they are internal or external.
-        Returns 0.0 if the domain has never been timed.
-        """
-        total_time_s = self._domain_total_time_s.get(domain, 0.0)
-        if total_time_s == 0.0:
-            return 0.0
         y_int = self._domain_yield_internal.get(domain, 0)
         y_ext = self._domain_yield_external.get(domain, 0)
         return (y_ext + y_int) / total_time_s
@@ -259,16 +217,13 @@ class CrawlProfiler:
             y_int = self._domain_yield_internal.get(domain, 0)
             y_ext = self._domain_yield_external.get(domain, 0)
             errors = self._domain_error_count.get(domain, 0)
-            # Use the last-computed effective score (raw × depth_penalty).
-            # Falls back to raw score when _sync_frontier hasn't run yet (e.g. tests).
-            eff = self._domain_effective_score.get(domain, self.get_domain_score(domain))
             scored.append({
                 "domain": domain,
                 "crawls": crawls,
                 "yield_int": y_int,
                 "yield_ext": y_ext,
                 "errors": errors,
-                "score": round(eff, 3),
+                "score": round(self.get_domain_score(domain), 3),
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:n]
@@ -303,10 +258,8 @@ class CrawlProfiler:
     # ── Reporting helpers ──
 
     def _sync_frontier(self) -> tuple[int, dict]:
-        """Sync frontier stats, compute depth-penalised scores, push to scheduler.
+        """Sync frontier stats, push UPS scores to scheduler.
 
-        Effective score = raw_score × depth_penalty(shallowest URL in domain queue)
-        Stored in _domain_effective_score for use by get_top_domains().
         Returns (dropped, states).
         """
         if not self._frontier_ref:
@@ -316,14 +269,10 @@ class CrawlProfiler:
         frontier_states = getattr(self._frontier_ref, 'state_stats', {})
         if callable(frontier_states):
             frontier_states = {}
-        scores: dict[str, float] = {}
-        for domain in self._domain_crawl_count:
-            raw = self.get_domain_score(domain)
-            min_depth = self._frontier_ref.get_domain_min_url_depth(domain)
-            penalty = self._depth_penalty(min_depth)
-            eff = raw * penalty
-            self._domain_effective_score[domain] = eff
-            scores[domain] = eff
+        scores: dict[str, float] = {
+            domain: self.get_domain_score(domain)
+            for domain in self._domain_crawl_count
+        }
         if scores:
             self._frontier_ref.update_domain_priorities(scores)
         return frontier_dropped, frontier_states
@@ -345,13 +294,12 @@ class CrawlProfiler:
             visible.append(d)
             if len(visible) == 5:
                 break
-        lines = "\n\n  \U0001f3c6 TOP DOMAINS (by discovery score)"
+        lines = "\n\n  \U0001f3c6 TOP DOMAINS (by UPS)"
         for d in visible:
-            ups = self.get_domain_ups(d["domain"])
             lines += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
-                f"crawls:{d['crawls']:>4}  score:{d['score']:.2f}  ups:{ups:.2f}"
+                f"crawls:{d['crawls']:>4}  ups:{d['score']:.2f}"
             )
         return lines
 
@@ -359,12 +307,11 @@ class CrawlProfiler:
         """Render the TOP CRAWLED DOMAINS table lines."""
         lines = "\n\n  \U0001f522 TOP CRAWLED DOMAINS"
         for d in top_crawled:
-            ups = self.get_domain_ups(d["domain"])
             lines += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
-                f"score:{d['score']:>6.2f}  ups:{ups:.2f}"
+                f"ups:{d['score']:>6.2f}"
             )
         return lines
 

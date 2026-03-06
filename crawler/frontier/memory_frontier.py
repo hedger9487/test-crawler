@@ -218,13 +218,13 @@ class MemoryFrontier(AbstractFrontier):
         return self._tie_counter
 
     def _effective_priority(self, domain: str) -> float:
-        """Return the domain's real yield score.
+        """Return the domain's UPS score.
 
-        score = (Y_ext × 10 + Y_int) / T  (URLs per second, pushed by profiler)
+        score = (Y_ext + Y_int) / T  (URLs per second, pushed by profiler)
         Defaults to 1.0 for unexplored domains.
 
         Immature vs Mature is only a label that controls which heap the domain
-        lands in (_ready_explore vs _ready_mature).  The numeric score is the
+        lands in (_ready_explore vs _ready_score).  The numeric score is the
         same formula for both — no flat boost, no cap.
         """
         return self._domain_yield.get(domain, 1.0)
