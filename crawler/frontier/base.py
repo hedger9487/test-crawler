@@ -12,13 +12,19 @@ class CrawlURL:
     """A URL queued for crawling."""
     url: str
     domain: str
-    depth: int = 0
-    priority: float = 0.0  # lower = higher priority
+    depth: int = 0       # BFS hop depth from seed
+    url_depth: int = 0   # Full-URL slash count (includes https:// prefix):
+                          # https://example.com/          → 3
+                          # https://example.com/sports/x/ → 6
+                          # Used for within-domain queue ordering (shallow first).
+    priority: float = 0.0   # reserved for caller overrides (not used by default scheduler)
     issue_time: float = 0.0  # set by frontier at dispatch time
     reservation_id: int = 0  # set by frontier when domain enters Reserved
 
     def __lt__(self, other: "CrawlURL") -> bool:
-        return self.priority < other.priority
+        # Within a domain queue: prefer shallow BFS hops first,
+        # then prefer URLs with fewer path segments (less deeply nested pages).
+        return (self.depth, self.url_depth) < (other.depth, other.url_depth)
 
 
 class AbstractFrontier(abc.ABC):

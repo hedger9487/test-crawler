@@ -6,9 +6,7 @@ import time
 import crawler.frontier.memory_frontier as frontier_module
 from crawler.frontier.memory_frontier import (
     MemoryFrontier,
-    _EXPLORE_PRIORITY,
     _EXPLORE_ISSUE_LIMIT,
-    _MAX_SCORE_PRIORITY,
 )
 
 
@@ -144,35 +142,42 @@ async def test_cooling_promotes_back_to_ready_when_time_passes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_explore_tier_beats_mature_regardless_of_score():
+async def test_explore_lane_prefers_immature_domain():
+    """In the explore lane (even parity), _ready_explore is tried first so an
+    immature domain is dispatched before a mature one."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    # mature.com has maximum score but is past the explore limit
+    # mature.com has a high score but is past the explore limit → _ready_mature
     frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
     frontier.update_domain_priorities({"mature.com": 999999.0})
 
     await frontier.add_url("https://mature.com/1")
-    # new.com has never been issued (issue_count=0) → Explore tier
+    # new.com has never been issued (issue_count=0) → _ready_explore
     await frontier.add_url("https://new.com/1")
 
+    # parity=0 → explore lane → _ready_explore first → new.com wins
+    assert frontier._dispatch_parity == 0
     first = await frontier.get_next()
     assert first is not None
     assert first.domain == "new.com"
 
 
 @pytest.mark.asyncio
-async def test_explore_tier_covers_all_issue_counts_below_limit():
+async def test_all_issue_counts_below_limit_go_to_explore_heap():
+    """All issue_counts below _EXPLORE_ISSUE_LIMIT land in _ready_explore,
+    so the explore lane will dispatch them before mature domains."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    # Both issue_count=1 and issue_count=2 are still Explore tier
-    # and should beat any Mature domain.
+    # partial.com at issue_count=_EXPLORE_ISSUE_LIMIT-1 → still immature → _ready_explore
     frontier._domain_issue_count["partial.com"] = _EXPLORE_ISSUE_LIMIT - 1
     frontier._domain_issue_count["mature.com"] = _EXPLORE_ISSUE_LIMIT
-    frontier.update_domain_priorities({"partial.com": -1.0, "mature.com": 999999.0})
+    frontier.update_domain_priorities({"partial.com": 5.0, "mature.com": 999999.0})
 
     await frontier.add_url("https://partial.com/1")
     await frontier.add_url("https://mature.com/1")
 
+    # parity=0 → explore lane → _ready_explore first → partial.com wins
+    assert frontier._dispatch_parity == 0
     first = await frontier.get_next()
     assert first is not None
     assert first.domain == "partial.com"
@@ -251,41 +256,41 @@ async def test_mark_acquired_rejects_mismatched_reservation():
 # Priority tier correctness (from log anomalies)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_effective_priority_tier_boundaries():
-    """_effective_priority must return exact tier values at all boundaries."""
+def test_effective_priority_returns_real_yield_score():
+    """_effective_priority must return the actual yield score for all domains.
+
+    There is no flat tier boost and no score cap — immature and mature domains
+    both use the same formula score.  The immature/mature label only determines
+    which heap (_ready_explore vs _ready_mature) a domain is placed in.
+    """
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
     frontier._domain_yield["d"] = 500.0
 
-    # Explore: any issue_count < _EXPLORE_ISSUE_LIMIT → always _EXPLORE_PRIORITY
+    # Immature domain (issue_count < _EXPLORE_ISSUE_LIMIT) → real score, no boost
     for cnt in range(_EXPLORE_ISSUE_LIMIT):
         frontier._domain_issue_count["d"] = cnt
-        assert frontier._effective_priority("d") == _EXPLORE_PRIORITY, (
-            f"issue_count={cnt} must be Explore tier"
+        assert frontier._effective_priority("d") == 500.0, (
+            f"issue_count={cnt}: should return real yield score 500.0, not a flat constant"
         )
 
-    # Mature entry: issue_count == _EXPLORE_ISSUE_LIMIT → score (capped at _MAX_SCORE_PRIORITY)
+    # Mature domain → same real score
     frontier._domain_issue_count["d"] = _EXPLORE_ISSUE_LIMIT
-    assert frontier._effective_priority("d") == min(500.0, _MAX_SCORE_PRIORITY)
+    assert frontier._effective_priority("d") == 500.0
 
-    # Mature: high issue count, score below cap → raw score returned
+    # High issue count, different score value
     frontier._domain_issue_count["d"] = 172
     frontier._domain_yield["d"] = 13.1
     assert frontier._effective_priority("d") == 13.1
 
-    # Mature: score above cap → clamped
+    # Very high score → returned as-is, no capping
     frontier._domain_yield["d"] = 2_000_000.0
-    assert frontier._effective_priority("d") == _MAX_SCORE_PRIORITY
+    assert frontier._effective_priority("d") == 2_000_000.0
 
 
-def test_effective_priority_unknown_domain_defaults_to_explore():
-    """A domain with no issue_count entry is treated as Explore tier."""
+def test_effective_priority_unknown_domain_defaults_to_one():
+    """A domain with no yield score yet defaults to 1.0."""
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
-    assert frontier._effective_priority("never.seen.com") == _EXPLORE_PRIORITY
-
-
-def test_score_cap_is_below_explore():
-    """Even the maximum possible Mature score must be below Explore priority."""
-    assert _MAX_SCORE_PRIORITY < _EXPLORE_PRIORITY
+    assert frontier._effective_priority("never.seen.com") == 1.0
 
 
 @pytest.mark.asyncio
@@ -309,27 +314,31 @@ async def test_mature_domains_ordered_by_score():
 
 
 @pytest.mark.asyncio
-async def test_explore_tier_beats_max_score_mature():
+async def test_score_lane_picks_highest_score_regardless_of_maturity():
     """
-    An Explore domain (issue_count=1, score=0.001) must be dispatched
-    before a Mature domain with the maximum possible score.
-    This is by design: guarantee early crawls before competing on score.
+    In the score lane (odd parity), _ready_score covers all domains.
+    A high-scoring immature domain should win over a low-scoring mature one.
     """
     frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
 
-    frontier._domain_issue_count["explore.com"] = 1
-    frontier._domain_issue_count["mature.com"] = 172
+    frontier._domain_issue_count["young.com"] = 1   # immature
+    frontier._domain_issue_count["old.com"]   = 172  # mature
     frontier.update_domain_priorities({
-        "explore.com": 0.001,
-        "mature.com": _MAX_SCORE_PRIORITY,
+        "young.com": 500.0,   # high score
+        "old.com":   0.5,     # low score
     })
 
-    await frontier.add_url("https://explore.com/1")
-    await frontier.add_url("https://mature.com/1")
+    await frontier.add_url("https://young.com/1")
+    await frontier.add_url("https://old.com/1")
 
+    # Force odd parity → score lane
+    frontier._dispatch_parity = 1
     first = await frontier.get_next()
     assert first is not None
-    assert first.domain == "explore.com"
+    assert first.domain == "young.com", (
+        "score lane must pick highest yield (young.com=500) over low yield (old.com=0.5) "
+        "regardless of maturity label"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -536,4 +545,28 @@ async def test_requeued_url_gets_fresh_issue_time(monkeypatch):
     assert second.url == first.url
     assert second.issue_time == 2000.0, (
         "Requeued URL must receive a fresh issue_time on re-dispatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shallow_url_dispatched_before_deep_url_same_domain():
+    """
+    Within the same domain queue, a URL with fewer path segments (lower
+    url_depth) must be dispatched before a deeply nested one.
+    CrawlURL.__lt__ uses (depth, url_depth) so shallower URLs sort first.
+    """
+    frontier = MemoryFrontier(bloom_capacity=1_000, max_pending=100)
+    frontier.set_cooldown_checker(lambda _: 0.0)
+
+    # Add deep URL first to ensure ordering is not insertion-order
+    await frontier.add_url("https://example.com/a/b/c/d/e/deep-page")  # 7 slashes
+    await frontier.add_url("https://example.com/shallow")               # 3 slashes
+
+    item = await frontier.get_next()
+    assert item is not None
+    assert "shallow" in item.url, (
+        f"Shallow URL must be dispatched first, got: {item.url}"
+    )
+    assert item.url_depth < 7, (
+        f"url_depth should be low for shallow URL, got {item.url_depth}"
     )
