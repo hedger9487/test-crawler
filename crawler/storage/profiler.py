@@ -209,6 +209,19 @@ class CrawlProfiler:
         y_ext = self._domain_yield_external.get(domain, 0)
         return (y_ext * _EXT_W + y_int * _INT_W) / total_time_s
 
+    def get_domain_ups(self, domain: str) -> float:
+        """Raw URLs-per-second: (Y_ext + Y_int) / T, unweighted.
+
+        Pure throughput regardless of link type.
+        Returns 0.0 if the domain has never been timed.
+        """
+        total_time_s = self._domain_total_time_s.get(domain, 0.0)
+        if total_time_s == 0.0:
+            return 0.0
+        y_int = self._domain_yield_internal.get(domain, 0)
+        y_ext = self._domain_yield_external.get(domain, 0)
+        return (y_ext + y_int) / total_time_s
+
     def get_top_domains(self, n: int = 50) -> List[Dict]:
         """Get top N domains sorted by effective (depth-penalised) discovery score.
 
@@ -230,6 +243,7 @@ class CrawlProfiler:
                 "yield_ext": y_ext,
                 "errors": errors,
                 "score": round(self.get_domain_score(domain), 3),
+                "ups": round(self.get_domain_ups(domain), 3),
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:n]
@@ -245,6 +259,7 @@ class CrawlProfiler:
                 "success": success,
                 "success_rate": (success / crawls * 100) if crawls > 0 else 0.0,
                 "score": round(self.get_domain_score(domain), 3),
+                "ups": round(self.get_domain_ups(domain), 3),
             })
         rows.sort(key=lambda x: x["crawls"], reverse=True)
         return rows[:n]
@@ -300,12 +315,12 @@ class CrawlProfiler:
             visible.append(d)
             if len(visible) == 5:
                 break
-        lines = "\n\n  \U0001f3c6 TOP DOMAINS (by UPS)"
+        lines = "\n\n  \U0001f3c6 TOP DOMAINS (by weighted score)"
         for d in visible:
             lines += (
                 f"\n    {d['domain'][:33]:<33} "
                 f"ext:{d['yield_ext']:>5}  int:{d['yield_int']:>5}  "
-                f"crawls:{d['crawls']:>4}  ups:{d['score']:.2f}"
+                f"crawls:{d['crawls']:>4}  score:{d['score']:.2f}  ups:{d['ups']:.2f}"
             )
         return lines
 
@@ -317,7 +332,7 @@ class CrawlProfiler:
                 f"\n    {d['domain'][:33]:<33} "
                 f"crawls:{d['crawls']:>5}  "
                 f"succ:{d['success_rate']:>5.1f}%  "
-                f"ups:{d['score']:>6.2f}"
+                f"score:{d['score']:>7.2f}  ups:{d['ups']:.2f}"
             )
         return lines
 

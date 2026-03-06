@@ -201,7 +201,7 @@ def test_get_top_domains_row_contains_expected_keys():
     p.record_discovered("x.com", internal_new=2, external_new=0)
 
     row = p.get_top_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "score"}
+    assert set(row.keys()) == {"domain", "crawls", "yield_int", "yield_ext", "errors", "score", "ups"}
 
 
 def test_get_top_domains_n_limits_results():
@@ -232,7 +232,7 @@ def test_get_most_crawled_domains_row_contains_expected_keys():
     p.record_fetch("k.com", status=200, latency_ms=300.0, is_html=True)
 
     row = p.get_most_crawled_domains(1)[0]
-    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "score"}
+    assert set(row.keys()) == {"domain", "crawls", "success", "success_rate", "score", "ups"}
 
 
 def test_get_most_crawled_domains_success_rate_calculation():
