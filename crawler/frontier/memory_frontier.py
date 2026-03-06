@@ -87,17 +87,15 @@ class BloomFilter:
 # Default cooldown when no checker is available (seconds)
 _DEFAULT_COOLDOWN = 2.0
 
-# Domain label for dispatch lanes:
-#   Immature (issue_count < _EXPLORE_ISSUE_LIMIT): placed in _ready_explore heap.
-#     Even-parity dispatch (explore lane) prefers this heap first so half of all
-#     workers are dedicated to priming new domains and organic discovery.
-#   Mature   (issue_count >= _EXPLORE_ISSUE_LIMIT): placed in _ready_mature heap.
-#     Odd-parity dispatch (score lane) pulls from _ready_score which covers ALL
-#     domains — an immature domain with already-high yield competes fairly.
-#
-#   Both immature and mature domains use the same real yield formula score.
-#   There is NO flat priority boost and NO score cap.
+# Domain scheduling tiers:
+#   Explore (issue_count < _EXPLORE_ISSUE_LIMIT): flat high priority — guarantee
+#     first few crawls before competing on score.
+#   Mature  (issue_count >= _EXPLORE_ISSUE_LIMIT): scored by discovered/attempts
+#     (avg new URLs per request regardless of success/failure).  Capped at
+#     _MAX_SCORE_PRIORITY so any Explore domain always outranks any Mature domain.
+_EXPLORE_PRIORITY = 3_000_000.0
 _EXPLORE_ISSUE_LIMIT = 3
+_MAX_SCORE_PRIORITY = 1_000_000.0
 
 
 class MemoryFrontier(AbstractFrontier):
@@ -128,24 +126,10 @@ class MemoryFrontier(AbstractFrontier):
 
         # ── Domain state management ──
 
-        # Ready: TWO heaps implementing two dedicated dispatch lanes.
-        # Both heaps use real yield score — no flat boosts, no cap.
-        #
-        # _ready_explore : immature domains only (issue_count < _EXPLORE_ISSUE_LIMIT)
-        #                  also present in _ready_score
-        # _ready_score   : ALL ready domains by real yield score
-        #
-        # Even parity (explore lane): _ready_explore → _ready_score fallback
-        #   Half of dispatches guaranteed for immature domains; primes robots.txt
-        #   cache and ensures organic discovery never starves.
-        # Odd parity (score lane): _ready_score only
-        #   Other half chases highest yield across everyone — immature domains
-        #   with already-high scores compete on equal footing.
-        #
-        # Stored as (-score, gen, tie_breaker, domain) for min-heap.
-        self._ready_explore: list[tuple[float, int, int, str]] = []
-        self._ready_score:   list[tuple[float, int, int, str]] = []
-        self._dispatch_parity: int = 0
+        # Ready: max-heap by yield score.
+        # Stored as (-yield_score, gen, tie_breaker, domain) for min-heap.
+        # gen = per-domain generation to detect stale entries.
+        self._ready: list[tuple[float, int, int, str]] = []
 
         # Cooling: min-heap by ready_at timestamp.
         # Stored as (ready_at, tie_breaker, domain).
@@ -218,56 +202,32 @@ class MemoryFrontier(AbstractFrontier):
         return self._tie_counter
 
     def _effective_priority(self, domain: str) -> float:
-        """Return the domain's yield score.
+        """Compute scheduling priority.
 
-        score = (Y_ext × 10 + Y_int) / T  (URLs per second, pushed by profiler)
-        Defaults to 1.0 for unexplored domains.
+        Explore tier (issue_count < _EXPLORE_ISSUE_LIMIT):
+          Flat _EXPLORE_PRIORITY for the first few crawls — every domain gets
+          a chance before score-based competition begins.
 
-        Immature vs Mature is only a label that controls which heap the domain
-        lands in (_ready_explore vs _ready_score).  The numeric score is the
-        same formula for both — no flat boost, no cap.
+        Mature tier (issue_count >= _EXPLORE_ISSUE_LIMIT):
+          score = discovered_urls / total_time_s  (URLs per second)
+          = Y/T, which equals ypc / avg_latency — naturally penalises both
+            low-yield pages and slow/timing-out domains without extra terms.
+          Capped at _MAX_SCORE_PRIORITY (< _EXPLORE_PRIORITY) so no Mature
+          domain can ever outrank an Explore-tier domain.
         """
-        return self._domain_yield.get(domain, 1.0)
-
-    def get_effective_priority(self, domain: str) -> float:
-        """Return the current scheduling priority score for a domain (public accessor)."""
-        return self._effective_priority(domain)
-
-    def domain_has_queued_urls(self, domain: str) -> bool:
-        """Return True if the domain still has at least one URL waiting in its queue."""
-        return bool(self._domain_queues.get(domain))
-
-    def get_domain_min_url_depth(self, domain: str) -> int:
-        """Return the url_depth of the shallowest URL in the domain's queue.
-
-        The domain queue is a min-heap sorted by (depth, url_depth), so index 0
-        is always the shallowest pending URL.  Returns 0 if the queue is empty.
-        """
-        queue = self._domain_queues.get(domain)
-        if not queue:
-            return 0
-        return queue[0].url_depth
+        issue_count = self._domain_issue_count.get(domain, 0)
+        if issue_count < _EXPLORE_ISSUE_LIMIT:
+            return _EXPLORE_PRIORITY
+        score = self._domain_yield.get(domain, 1.0)
+        return min(score, _MAX_SCORE_PRIORITY)
 
     def _push_ready(self, domain: str) -> None:
-        """Push domain into Ready heaps.
-
-        Immature domains (issue_count < _EXPLORE_ISSUE_LIMIT) go into both
-        _ready_explore and _ready_score so they participate in both lanes.
-        Mature domains go into _ready_score only.
-        Both heaps store the real yield score — no flat boosts, no cap.
-        """
+        """Push domain into the Ready heap."""
         self._reserved.pop(domain, None)
-        score = self._domain_yield.get(domain, 1.0)
+        score = self._effective_priority(domain)
         gen = self._domain_ready_gen[domain] + 1
         self._domain_ready_gen[domain] = gen
-
-        score_entry = (-score, gen, self._next_tie(), domain)
-        heapq.heappush(self._ready_score, score_entry)
-
-        if self._domain_issue_count.get(domain, 0) < _EXPLORE_ISSUE_LIMIT:
-            explore_entry = (-score, gen, self._next_tie(), domain)
-            heapq.heappush(self._ready_explore, explore_entry)
-
+        heapq.heappush(self._ready, (-score, gen, self._next_tie(), domain))
         self._domain_state[domain] = "ready"
 
     def _start_reservation_locked(self, domain: str, item: CrawlURL) -> CrawlURL:
@@ -294,32 +254,6 @@ class MemoryFrontier(AbstractFrontier):
             self._push_cooling(domain, cooldown)
         else:
             self._push_ready(domain)
-
-    def _issue_from_cooling_forced(self, t_acquired: float) -> Optional["CrawlURL"]:
-        """Pop the soonest cooling domain and issue its next URL, bypassing cooldown.
-
-        Called only when all Ready heaps are empty — minimises worker idle time
-        at the cost of skipping the politeness cooldown for one request.
-        Records a cooldown_skip for monitoring.
-        """
-        if not self._cooling:
-            return None
-        _, _, domain = heapq.heappop(self._cooling)
-        queue = self._domain_queues.get(domain)
-        if not queue:
-            self._set_empty(domain)
-            self._lock_hold_total += time.monotonic() - t_acquired
-            return None
-        item = heapq.heappop(queue)
-        item.issue_time = time.monotonic()
-        self._pending_count -= 1
-        self._cooldown_skips += 1
-        self._issued_domains.append(domain)
-        self._domain_issue_count[domain] += 1
-        self._ready_dispatch_count += 1
-        item = self._start_reservation_locked(domain, item)
-        self._lock_hold_total += time.monotonic() - t_acquired
-        return item
 
     def _issue_from_ready_domain_locked(self, domain: str) -> Optional[CrawlURL]:
         """Issue one URL from a ready domain while holding frontier lock.
@@ -369,12 +303,11 @@ class MemoryFrontier(AbstractFrontier):
                 self._set_empty(domain)
 
     def _rebuild_ready_heap(self) -> None:
-        """Rebuild both Ready heaps with latest scores."""
+        """Rebuild Ready heap from current ready domains using latest scores."""
         if not self._needs_ready_rebuild:
             return
 
-        explore_entries: list[tuple[float, int, int, str]] = []
-        score_entries:   list[tuple[float, int, int, str]] = []
+        entries: list[tuple[float, int, int, str]] = []
         to_empty: list[str] = []
 
         for domain, state in self._domain_state.items():
@@ -384,24 +317,16 @@ class MemoryFrontier(AbstractFrontier):
             if not queue:
                 to_empty.append(domain)
                 continue
-            score = self._domain_yield.get(domain, 1.0)
+            score = self._effective_priority(domain)
             gen = self._domain_ready_gen[domain] + 1
             self._domain_ready_gen[domain] = gen
-
-            score_entry = (-score, gen, self._next_tie(), domain)
-            score_entries.append(score_entry)
-
-            if self._domain_issue_count.get(domain, 0) < _EXPLORE_ISSUE_LIMIT:
-                explore_entry = (-score, gen, self._next_tie(), domain)
-                explore_entries.append(explore_entry)
+            entries.append((-score, gen, self._next_tie(), domain))
 
         for domain in to_empty:
             self._set_empty(domain)
 
-        heapq.heapify(explore_entries)
-        heapq.heapify(score_entries)
-        self._ready_explore = explore_entries
-        self._ready_score   = score_entries
+        heapq.heapify(entries)
+        self._ready = entries
         self._needs_ready_rebuild = False
 
     # ── Core API ──
@@ -454,16 +379,8 @@ class MemoryFrontier(AbstractFrontier):
 
         domain = get_domain(normalized) or "unknown"
 
-        # url_depth: count ALL slashes in the full URL string.
-        # This includes the two from https:// so baselines are:
-        #   https://example.com/          → 3
-        #   https://example.com/page      → 3
-        #   https://example.com/a/b/c/    → 6
-        # Shallow URLs (small url_depth) are preferred within a domain queue.
-        url_depth = normalized.count("/")
-
         crawl_url = CrawlURL(
-            url=normalized, domain=domain, depth=depth, url_depth=url_depth,
+            url=normalized, domain=domain, depth=depth, priority=float(depth)
         )
         heapq.heappush(self._domain_queues[domain], crawl_url)
         self._pending_count += 1
@@ -497,39 +414,45 @@ class MemoryFrontier(AbstractFrontier):
             self._promote_cooling()
             self._rebuild_ready_heap()
 
-            # Step 2: two dedicated dispatch lanes alternating on parity.
-            #
-            #   Even parity — EXPLORE lane:
-            #     Primary:  _ready_explore  (immature domains, issue_count < 3)
-            #     Fallback: _ready_score    (all domains, for when explore is empty)
-            #     Guarantees half of dispatches go to new domains → organic discovery.
-            #
-            #   Odd parity — SCORE lane:
-            #     Primary:  _ready_score    (all domains by real yield score)
-            #     No fallback needed: every ready domain is already in _ready_score.
-            #
-            use_score_lane = self._dispatch_parity % 2 == 1
-            self._dispatch_parity += 1
+            # Step 2: find a ready domain with URLs
+            # (stale entries in heap are possible if yield scores changed)
+            # Pure priority order: Explore-tier domains (issue_count < _EXPLORE_ISSUE_LIMIT)
+            # always outrank Mature domains because _EXPLORE_PRIORITY > _MAX_SCORE_PRIORITY.
+            while self._ready:
+                neg_score, gen, tie, domain = heapq.heappop(self._ready)
 
-            heaps = (
-                (self._ready_score,)
-                if use_score_lane
-                else (self._ready_explore, self._ready_score)
-            )
-            for heap in heaps:
-                while heap:
-                    neg_score, gen, tie, domain = heapq.heappop(heap)
-                    if gen != self._domain_ready_gen.get(domain, 0):
-                        self._stale_pops += 1
-                        continue
-                    item = self._issue_from_ready_domain_locked(domain)
-                    if item is None:
-                        continue
+                # Skip stale entries: gen must match current domain gen
+                if gen != self._domain_ready_gen.get(domain, 0):
+                    self._stale_pops += 1
+                    continue
+
+                item = self._issue_from_ready_domain_locked(domain)
+                if item is None:
+                    continue
+
+                self._lock_hold_total += time.monotonic() - t_acquired
+                return item
+
+            # No ready domains — check if any cooling domains exist
+            # If so, pop the soonest one (minimize worker idle time)
+            if self._cooling:
+                _, _, domain = heapq.heappop(self._cooling)
+                queue = self._domain_queues.get(domain)
+                if queue:
+                    item = heapq.heappop(queue)
+                    item.issue_time = time.monotonic()
+                    self._pending_count -= 1
+                    self._cooldown_skips += 1  # counts as "forced skip of cooldown"
+                    self._issued_domains.append(domain)
+                    self._domain_issue_count[domain] += 1
+                    self._ready_dispatch_count += 1
+                    item = self._start_reservation_locked(domain, item)
+
                     self._lock_hold_total += time.monotonic() - t_acquired
                     return item
 
-            # No ready domains — try the soonest cooling domain to avoid idle
-            return self._issue_from_cooling_forced(t_acquired)
+            self._lock_hold_total += time.monotonic() - t_acquired
+            return None  # frontier truly empty
 
     async def requeue_issued_url(self, item: CrawlURL) -> bool:
         """Put an already-issued URL back into the domain queue and release
@@ -634,7 +557,7 @@ class MemoryFrontier(AbstractFrontier):
     def state_stats(self) -> dict:
         """Domain state distribution."""
         return {
-            "ready": len(self._ready_score),
+            "ready": len(self._ready),
             "reserved": len(self._reserved),
             "cooling": len(self._cooling),
             "empty": len(self._empty),
@@ -648,8 +571,7 @@ class MemoryFrontier(AbstractFrontier):
             state = {
                 "bloom": self._bloom,
                 "domain_queues": dict(self._domain_queues),
-                "ready_explore": list(self._ready_explore),
-                "ready_score":   list(self._ready_score),
+                "ready": list(self._ready),
                 "cooling": list(self._cooling),
                 "empty": set(self._empty),
                 "reserved": dict(self._reserved),
@@ -678,14 +600,7 @@ class MemoryFrontier(AbstractFrontier):
             self._domain_queues = collections.defaultdict(
                 list, state["domain_queues"]
             )
-            # Support new (2-heap) and old (3-heap or 1-heap) checkpoint formats.
-            if "ready_explore" in state and "ready_score" in state:
-                self._ready_explore = state["ready_explore"]
-                self._ready_score   = state["ready_score"]
-            else:
-                self._ready_explore = []
-                self._ready_score   = []
-                self._needs_ready_rebuild = True
+            self._ready = state.get("ready", [])
             self._cooling = state.get("cooling", [])
             self._empty = state.get("empty", set())
             self._reserved = dict(state.get("reserved", {}))

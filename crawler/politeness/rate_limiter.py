@@ -71,6 +71,7 @@ class RateLimiter:
 
         self._buckets: Dict[str, _DomainBucket] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
 
         self._cleanup_task: asyncio.Task | None = None
 
@@ -103,13 +104,11 @@ class RateLimiter:
         Returns:
             The actual wait time in seconds (0 if no wait needed).
         """
-        # Get or create per-domain lock.
-        # No global lock needed: asyncio is single-threaded, so there is no
-        # context switch between .get() and .setdefault() — the dict cannot be
-        # mutated by another coroutine while we are between these two lines.
-        lock = self._locks.get(domain)
-        if lock is None:
-            lock = self._locks.setdefault(domain, asyncio.Lock())
+        # Get or create per-domain lock
+        async with self._global_lock:
+            if domain not in self._locks:
+                self._locks[domain] = asyncio.Lock()
+            lock = self._locks[domain]
 
         t0 = time.monotonic()
 
@@ -157,19 +156,6 @@ class RateLimiter:
         deficit = 1.0 - simulated_tokens
         return deficit / bucket.refill_rate
 
-    async def backoff_domain(self, domain: str, extra_seconds: float = 60.0) -> None:
-        """Drain the token bucket for *domain* to force a longer cooldown.
-
-        Call this after a 429 response so the domain waits approximately
-        *extra_seconds* before the next fetch attempt, on top of the normal
-        politeness interval.
-        """
-        bucket = self._buckets.get(domain)
-        if bucket:
-            bucket.refill()
-            # Drain enough tokens to enforce extra_seconds additional wait.
-            bucket.tokens -= extra_seconds * bucket.refill_rate
-
     @property
     def default_interval(self) -> float:
         """The base interval between requests (1/max_qps)."""
@@ -195,16 +181,17 @@ class RateLimiter:
             try:
                 await asyncio.sleep(self._cleanup_interval)
                 now = time.monotonic()
-                expired = [
-                    domain
-                    for domain, bucket in self._buckets.items()
-                    if (now - bucket.last_used) > self._idle_cleanup
-                ]
-                for domain in expired:
-                    del self._buckets[domain]
-                    self._locks.pop(domain, None)
-                if expired:
-                    logger.debug("Cleaned up %d idle domain buckets", len(expired))
+                async with self._global_lock:
+                    expired = [
+                        domain
+                        for domain, bucket in self._buckets.items()
+                        if (now - bucket.last_used) > self._idle_cleanup
+                    ]
+                    for domain in expired:
+                        del self._buckets[domain]
+                        self._locks.pop(domain, None)
+                    if expired:
+                        logger.debug("Cleaned up %d idle domain buckets", len(expired))
             except asyncio.CancelledError:
                 raise
             except Exception as e:

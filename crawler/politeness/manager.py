@@ -47,10 +47,6 @@ class PolitenessManager:
             return await self._rate_limiter.acquire(domain, crawl_delay=crawl_delay)
         return 0.0
 
-    async def backoff_domain(self, domain: str, extra_seconds: float = 60.0) -> None:
-        """Apply post-429 backoff to *domain* in the rate limiter."""
-        await self._rate_limiter.backoff_domain(domain, extra_seconds)
-
     async def start(self) -> None:
         await self._rate_limiter.start()
 
