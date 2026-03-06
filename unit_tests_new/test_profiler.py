@@ -29,7 +29,7 @@ def test_score_is_zero_when_domain_has_attempts_but_no_yield():
 
 
 def test_score_equals_yield_divided_by_total_time():
-    """score = (Y_ext + Y_int) / T"""
+    """score = (Y_ext*_EXT_W + Y_int*_INT_W) / T"""
     p = _make_profiler()
     # 3 attempts × 1 000 ms each → total_time_s = 3.0
     for _ in range(3):
@@ -37,15 +37,20 @@ def test_score_equals_yield_divided_by_total_time():
     # 6 internal URLs discovered, no external
     p.record_discovered("a.com", internal_new=6, external_new=0)
 
+    # Y_weighted = 0*10 + 6*1 = 6
     expected = 6 / 3.0  # = 2.0
     assert p.get_domain_score("a.com") == pytest.approx(expected)
 
 
-def test_internal_and_external_links_weighted_equally():
+def test_link_weights_ext10_int1():
     """
-    Internal and external URLs both count equally in the UPS score.
-    Two domains with the same total yield and same latency score identically
-    regardless of whether the yield came from internal or external links.
+    Verify the scoring weights:
+      external link: _EXT_W = 10  (cross-site hub, heavily rewarded)
+      internal link: _INT_W = 1   (only deepens current domain, minimal weight)
+    With equal link counts and latency:
+      hub.com  (5 ext)  score = 5*10 / 1.0 = 50
+      silo.com (5 int)  score = 5*1  / 1.0 = 5
+    So external-hub scores 10× internal-only.
     """
     p = _make_profiler()
 
@@ -55,10 +60,12 @@ def test_internal_and_external_links_weighted_equally():
     p.record_fetch("silo.com", status=200, latency_ms=1_000.0, is_html=True)
     p.record_discovered("silo.com", internal_new=5, external_new=0)
 
-    # Both: Y = 5, T = 1.0 → ups = 5.0
-    assert p.get_domain_score("hub.com")  == pytest.approx(5 / 1.0)
+    # hub.com: Y = 5*10 = 50; silo.com: Y = 5*1 = 5
+    assert p.get_domain_score("hub.com")  == pytest.approx(50 / 1.0)
     assert p.get_domain_score("silo.com") == pytest.approx(5 / 1.0)
-    assert p.get_domain_score("hub.com")  == pytest.approx(p.get_domain_score("silo.com"))
+    assert p.get_domain_score("hub.com") == pytest.approx(
+        p.get_domain_score("silo.com") * 10
+    )
 
 
 def test_faster_domain_scores_higher_than_slower_equal_yield_domain():

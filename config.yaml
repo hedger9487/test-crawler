@@ -60,9 +60,7 @@ frontier:
   bloom_error_rate: 0.001
 
   # Maximum crawl depth from seed (-1 = unlimited)
-  # Limit to 4 so the budget stays broad rather than drilling into one cluster.
-  # depth=0: seeds, 1: their links, 2: two hops out, 3: three hops, 4: four hops
-  max_depth: 4
+  max_depth: -1
 
   # Checkpoint interval in seconds
   checkpoint_interval: 300

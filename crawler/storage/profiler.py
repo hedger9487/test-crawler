@@ -25,10 +25,13 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# ── Scoring ──
-# score = (Y_ext + Y_int) / T   (URLs per second — UPS)
-#   Y_ext + Y_int: total new URLs discovered (internal + external)
-#   T:             total fetch time in seconds (failures/timeouts burn T without yield)
+# ── Scoring weights ──
+# score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
+#   Y_ext: new URLs pointing to OTHER domains (cross-site discovery) ← heavily rewarded
+#   Y_int: new URLs within the SAME domain (internal graph)          ← minimal weight
+#   T:     total fetch time in seconds (failures/timeouts burn T without yield)
+_EXT_W: int = 10
+_INT_W: int = 1
 
 
 @dataclass
@@ -185,11 +188,14 @@ class CrawlProfiler:
     # ── Domain scoring (for crawl strategy) ──
 
     def get_domain_score(self, domain: str) -> float:
-        """Compute scheduling priority score for a domain (UPS — URLs per second).
+        """Compute scheduling priority score for a domain.
 
-        score = (Y_ext + Y_int) / T
+        score = (Y_ext × _EXT_W + Y_int × _INT_W) / T
 
-          Y_ext + Y_int: total new URLs discovered across all crawls for this domain.
+          Y_ext × _EXT_W: external links heavily rewarded — cross-site hubs
+            drive organic discovery of new domains.
+          Y_int × _INT_W: internal links given minimal weight — they only
+            deepen the current domain rather than expanding coverage.
           T: total fetch time — failed/timeout attempts increase T without
              contributing yield, automatically penalising error-heavy domains.
 
@@ -201,7 +207,7 @@ class CrawlProfiler:
 
         y_int = self._domain_yield_internal.get(domain, 0)
         y_ext = self._domain_yield_external.get(domain, 0)
-        return (y_ext + y_int) / total_time_s
+        return (y_ext * _EXT_W + y_int * _INT_W) / total_time_s
 
     def get_top_domains(self, n: int = 50) -> List[Dict]:
         """Get top N domains sorted by effective (depth-penalised) discovery score.
